@@ -553,7 +553,7 @@ strace -c -f <program>
 # - 是否有 execve/spawn 执行新程序
 ```
 
-### 3.6 ptrace 注入
+### 3.8 ptrace 注入
 
 `ptrace` 是 Linux 的进程跟踪系统调用，允许一个进程（tracer）控制另一个进程（tracee）的执行——包括读写内存、修改寄存器、单步执行等。它是 `strace`、调试器（GDB）和系统调用注入工具的基础。
 
@@ -609,7 +609,7 @@ void inject_syscall(pid_t child,
 
 **安全意义**：ptrace 注入是动态分析工具（如系统调用替换、沙箱实现）的基础技术。但同时，ptrace 也是攻击者可能利用的工具——例如，恶意进程可以通过 ptrace 注入修改其他进程的系统调用行为。因此，许多安全机制（如 Docker 的 `--security-opt seccomp=...`）默认禁用 `ptrace` 系统调用。
 
-### 3.8 syscall 安全审计最佳实践
+### 3.9 syscall 安全审计最佳实践
 
 对运行中的进程或服务进行系统调用审计，是识别异常行为、检测恶意软件与做安全加固的重要手段。常见的审计手段与各自的适用场景如下：
 
