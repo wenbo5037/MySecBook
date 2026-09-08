@@ -282,7 +282,44 @@ kmalloc-8         512   512      8  512    1 : tunables ...
 
 `slabtop` 是交互式实时查看工具（类 `top`），能按活动对象数/Z 大小排序，帮助诊断内核内存增长与泄漏。
 
-### 3.4 安全视角：为什么内核分配器是攻击面
+### 3.4 物理内存直接映射与 PAGE_OFFSET
+
+理解内核内存管理的另一个关键点是**直接映射（direct mapping）**。现代 64 位内核把物理内存"直接映射"到内核虚拟地址空间的一个线性区域，起点称为 `PAGE_OFFSET`（x86-64 通常约 `ffff888000000000` 附近，具体由 `CONFIG_PAGE_OFFSET` 与 KASLR 决定）：
+
+```text
+x86-64 内核地址空间（示意）：
+┌──────────────────────────────────────────────┐
+│ FIXADDR/  vmalloc 区域  vmalloc(...)         │
+│ ...                                          │
+│ PAGE_OFFSET ──► 物理内存直接映射区（线性映射）  │
+│   内核访问"物理页 X"只要用  __va(phys)        │
+│   不需要额外建页表（KASLR 后基址随机化）       │
+└──────────────────────────────────────────────┘
+```
+
+直接映射意味着内核访问大多数物理内存**不需要建立专门的页表项**，`kmalloc` 拿到的内存就落在直接映射区，所以快。而 `vmalloc` 不同——它落在 vmalloc 区域，需要**临时建立页表映射**，这就是 vmalloc 慢的物理原因。理解 `PAGE_OFFSET`/直接映射，是把"kmalloc 快、vmalloc 慢"从经验上升为原理的必经之路。
+
+### 3.5 页表开销与物理连续的另一面
+
+内存分配的"物理连续性"还影响着系统的**页表与 TLB**。`vmalloc` 使用**分散的物理页**，意味着要用很多页表项去描述，且 TLB 命中率可能更低；而 `kmalloc` 的连续物理内存常通过大页（hugepage）等方式获得更好的 TLB 覆盖。因此在内核里"少用 vmalloc、多用 kmalloc + 合理分配"不仅是为了 DMA，也是为降低虚拟内存映射开销与 TLB miss。
+
+**内存热插拔与内存压缩**是更高级的话题：`memory_hotplug` 允许在线插拔内存；`zswap`/`zram` 通过压缩内存页来扩展可用内存。这些都属于"内核内存管理"这个大主题的延伸，本文聚焦分配器主线，将其点到为止。
+
+### 3.6 内存回收的细化指标
+
+`/proc/meminfo` 中与回收相关的关键指标：
+
+```bash
+# 查看内存压力与回收状态
+$ cat /proc/meminfo | grep -E '^(MemTotal|SwapTotal|Dirty|Shmem|Cached|AnonPages)'
+$ watch -n 1 "awk '/pgscan_direct|pgsteal_/ {print}' /proc/vmstat"   # 回收计数
+```
+
+- `pgscan_direct`/`pgsteal_direct` 持续增长：说明频繁发生 **direct reclaim**（同步回收），内存长期紧张。
+- `kswapd` 线程的高 CPU 占用：后台回收压力大。
+- 这些指标是判断"该加内存 / 该调优 / 有内存泄漏"的重要依据，也和本文 [[01-物理内存管理：分区分页分段演进史]] 的历史背景一脉相承。
+
+### 3.7 安全视角：为什么内核分配器是攻击面
 
 1. **内核堆喷射（Kernel Heap Spray）**：攻击者不断分配大量相同大小的对象，把可控制的数据填入 slab（如 `msg_msg`、`key` 对象、`userfaultfd` 对象等），使目标对象附近"布满可控数据"，配合 UAF/溢出把数据用起来。防御者要做到**对象隔离**、用 `KASLR`/`SLAB_FREELIST_RANDOM` 增加利用难度。
 2. **slab 溢出（metaclass）**：写越界到**相邻对象**，可改写相邻对象的函数指针、长度字段，实现任意读写（提权）。
@@ -385,6 +422,42 @@ $ stress-ng --vm 4 --vm-bytes 128M   # 分配远超限制
 ```
 
 生产环境应关注 `oom_score_adj`，对关键进程（如数据库、Kubernetes 组件）设置 `-1000` 豁免被误杀。
+
+### 4.5 直接回收与内存压力的观测实战
+
+在内存紧张的服务器上，用 `vmstat` 和 `/proc/vmstat` 判断是否发生了 direct reclaim 与 swap：
+
+```bash
+# vmstat 的 si/so（swap in/out）与 r（运行队列）可反映内存压力
+$ vmstat 2
+procs -----------memory---------- ---swap-- -----io----
+ r  b   swpd   free   buff  cache   si   so    bi    bo
+ 1  0  12345  1200   512  102400    0    12     5    20
+
+# 细看回收计数，判断 direct reclaim 是否频繁
+$ grep -E 'pgscan_(direct|kswapd)|pgsteal_(direct|kswapd)' /proc/vmstat
+pgscan_kswapd 50213
+pgscan_direct 834567    # 若 direct 很高 → 同步回收频繁 → 内存不足
+pgsteal_kswapd 49871
+pgsteal_direct 833210
+```
+
+当 `pgscan_direct` 远超 `pgscan_kswapd`，说明 kswapd（后台回收）来不及，频繁触发**同步直接回收**，应用会周期性卡顿。配合 `slabtop`/`buddyinfo` 定位是"伙伴系统碎片"还是"slab 泄漏"，再决定扩容、调优 `vm.swappiness`、或排查对象泄漏。
+
+### 4.6 理解并正确设置 vm.swappiness
+
+`/proc/sys/vm/swappiness`（0-100，默认 60）控制内核"在回收匿名页（换出到 swap）与回收文件页缓存之间"的倾向：
+
+```bash
+# 查看/设置（临时）
+$ cat /proc/sys/vm/swappiness
+60
+$ echo 10 > /proc/sys/vm/swappiness   # 低：更偏好保留文件缓存
+
+# 永久：写入 /etc/sysctl.conf
+```
+
+在**交互式/数据库**场景通常调低 swappiness 减少 swap 抖动；在**有大量匿名内存需要**的场合可能需要平衡。理解 swappiness 需要先理解"匿名页 vs 文件页"的区别：文件页（页缓存）可随时丢弃重读，匿名页（进程堆/栈）只能写回 swap——内核正是按这个权衡来决定先回收谁，这本身就是内存回收原理的直接应用。
 
 ---
 

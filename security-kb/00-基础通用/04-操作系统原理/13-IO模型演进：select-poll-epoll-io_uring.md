@@ -313,6 +313,28 @@ io_uring_queue_exit(&ring);                           // 释放
 
 `io_uring_wait_cqe` 前进程可以做任何事（处理业务、发起新请求），这就是"异步"在 API 层面的体现——进程没有亲自做拷贝系统调用。
 
+### 3.7 io_uring 的批量提交与轮询深入
+
+io_uring 之所以被称为"异步 IO 的终极形态"，除了减少系统调用，还在于它把**批量**和**轮询**做到了极致。
+
+**批量提交**：`io_uring_submit` 一次把 SQ 中尚未提交的**多个** SQE 全部提交，内核按序处理。配合 `io_uring_enter`（liburing 封装在 `submit` 内部），可以把"每请求一个系统调用"压缩成"一批请求一个系统调用"。在大量短小 IO（如日志写入、消息队列、网络 proxy）场景，这种摊薄效应非常显著——系统调用本身的固定开销（用户态/内核态切换、寄存器保存、上下文切换）被多个请求分摊。
+
+**轮询模式（IOPOLL, IORING_SETUP_IOPOLL）**：默认情况下，io_uring 靠**中断**通知 IO 完成。但对 NVMe 等高性能设备，中断可能在极高 IOPS 下成为瓶颈，因为每次中断都有固定延迟与调度开销。`IORING_SETUP_IOPOLL` 让内核在 `io_uring_enter` 时**主动轮询**设备完成队列，减少中断延迟抖动，能显著降低 p99 延迟。代价是**占用一个 CPU 核心持续忙等**，因此"轮询"通常与"核绑定 + 独占 CPU"搭配（例如 Seastar 框架的 polling mode）。
+
+**注册机制（Registered files / buffers）**：`io_uring_register` 可以：
+- 注册 `fd` 表：`io_uring_register_files` 把一批 fd 注册进内核，之后 `SQE` 用 `IOSQE_FIXED_FILE` 引用下标，省去每次对 fd 的安全校验与引用计数。
+- 注册缓冲区：`io_uring_register_buffers` 把用户缓冲区提前映射进内核，配合 `IORING_OP_READ_FIXED` 等固定缓冲区操作，跳过每次 IO 的页表映射与 COW（copy-on-write）检查。
+
+这两种注册机制让高频 IO 路径从"每次重做"变成"一次注册、反复使用"，能更进一步地摊薄开销，是追求极致性能时的关键开关。不过它们也带来了管理复杂度：注册后 fd 的生命周期需自行维护，缓冲区被内核引用期间不能随意释放，否则会读到悬空内存 —— 这也是 io_uring 引入的**新一类 bug 与安全风险**（内核拿到的 buffer 指针若无效可能引起崩溃或信息泄露）。
+
+### 3.8 信号驱动 IO 的局限
+
+作为五种模型之一，信号驱动 IO（`O_ASYNC`/`F_SETOWN`，数据就绪时内核发 `SIGIO` 信号）在理论上允许进程在处理信号前做别的，但它有两大硬伤，导致实际很少用于服务器：
+1. **不可靠**：信号可能丢失，且 SA_RESTART/非信号安全的处理棘手。
+2. **无法定位**：信号只告诉你"有些 fd 就绪了"，但你不知道是哪几个，还得自己轮询所有 fd 才能找出就绪者——瓶颈又回到 O(n)。
+
+因此信号驱动 IO 更多是理论/教学价值，现代高性能服务器几乎不使用它。以 `<boost::asio>`、libuv 等框架为代表的现代方案，都选择了"多路复用（epoll/kqueue/IOCP）+ 事件循环"或"io_uring"作为底层。
+
 ---
 
 ## 4. 实战与示例
@@ -527,6 +549,37 @@ int main(void) {
 ```
 
 编译：`gcc -o iouring_demo iouring_demo.c -luring`。注意内核需 ≥ 5.1（建议 ≥ 5.10 以获得较稳定特性），并使用较新的 liburing。
+
+### 4.4 Python asyncio：多路复用的现代事件循环封装
+
+`asyncio` 在 Linux 上底层正是基于 epoll 的事件循环，它把"注册回调、事件分发、状态机"隐藏起来，让开发者以"协程"的直觉写并发。理解它有助于把本文的 epoll 原理映射到实战：
+
+```python
+import asyncio
+
+async def echo_handler(reader, writer):
+    try:
+        while True:
+            data = await reader.read(100)          # 挂起，等待可读
+            if not data:
+                break
+            writer.write(data)                     # 写回
+            await writer.drain()
+    except ConnectionResetError:
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+async def main():
+    server = await asyncio.start_server(echo_handler, "127.0.0.1", 9002)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+```
+
+`await reader.read()` 之所以能"挂起而不阻塞线程"，正是因为事件循环把这次读注册进 epoll（监听 EPOLLIN），当 socket 可读时 epoll_wait 返回，事件循环再调度对应协程继续执行。这从工程角度验证了本文反复强调的结论：**多路复用是同步 IO，负责"等待就绪"；真正的数据拷贝仍由 `read`/`write` 系统调用完成**，只是被封装进了 `await` 的语义里。要获得"异步 IO"（数据拷贝由内核完成）的能力，则要依赖 io_uring 或内核 AIO 的封装，这正是 nginx 的 `aio` 指令、以及 Seastar 等框架交给 io_uring 的工作。
 
 ---
 
