@@ -47,7 +47,11 @@ epoll 用 **红黑树 + 就绪链表 + mmap** 实现了 O(1) 的就绪检测，�
 
 在连接模型上要纠正一个常见误解：**"连接数"不等于"线程数"**。使用 epoll 后，十万连接只需要几十个线程，甚至单线程就能承接——CPU 资源只在"有数据要读写"的瞬间被消耗，空闲连接只占一个 fd 与内核中的少量内存。这就是事件驱动（event-driven）与阻塞式（blocking）两种模型最大的分野。因此衡量一个服务能否支撑高并发，看的不是"连接/线程比"，而是"每个就绪事件的处理时长"与"事件循环是否被阻塞"。若 handler 里出现耗时操作（磁盘、锁、sleep），事件循环会被"抬住"，整个服务的吞吐瞬间垮掉——这是所有基于 epoll 框架的通用铁律。
 
+另一个维度是 **fd 资源预算**：linux 每进程默认 fd 上限 1024，高并发服务上线前必须 `ulimit -n 65535` 甚至 1048576，并同步调整 `fs.file-max`（系统级上限）。fd 泄漏是 epoll 服务最容易踩的运营事故——单看"连接数没涨"看不出问题，真正要看的是 `/proc/<pid>/fd` 的持续增长与 `ss -tan state close-wait`。这两条监控曲线，是高并发服务安全运行的生命线。
+
 本节作为 [[13-IO模型演进：select-poll-epoll-io_uring]] 的姊妹篇，重点深入 Socket 抽象、TCP 状态映射、以及 epoll 的内核实现细节。掌握本节之后，读 nginx worker 模型、Redis 单线程事件循环的源码都会有"原来如此"的体验。
+
+**什么时候不该用 epoll？** 值得泼一盆冷水：epoll 不是银弹。若单个连接的处理本身耗时较长（大文件读写、CPU 密集计算、外部 RPC），事件循环会被长任务抬住，其他连接集体饿死——此时"线程池 + 每连接一任务"反而更合理。e-poll 的适用边界是"海量连接、每个连接事件稀疏且处理短（微秒~毫秒）"。判断法则很朴素：**先看平均每个事件的处理时长，再看连接规模**。连接万级、事件处理短 → epoll；连接少但每个请求重 → 线程池进程模型。这条边界，正是 [[03-线程模型：内核线程用户线程与混合模型]] 与 [[04-协程原理：用户态调度与栈管理]] 的选型依据。
 
 ---
 
@@ -115,7 +119,7 @@ TCP 有 11 个状态（RFC 793），它们与 socket API 调用关系如下：
 - **CLOSE_WAIT**：收到对端 FIN，但本端还没 `close()`。*进程不 close、REPLACEMENT fd 挂 CLOSE_WAIT，是典型的 fd 泄漏症状*——实际排查时，CLOSE_WAIT 持续增长几乎必然意味着代码漏了 close。
 - **TIME_WAIT**：主动关闭方在收到 FIN 后停留 2×MSL（约 60 秒），用于兜底最后一个 ACK 丢失与旧报文失效。高并发短连接下 TIME_WAIT 多是正常现象，无脑调整反而破坏连接语义，详见 [[05-TCP状态机与TIME_WAIT调优]]。
 
-### 2.5 三次握手与两条队列：accept 为什么"慢"
+### 2.3 三次握手与两条队列：accept 为什么"慢"
 
 三次握手达成后，才进入 accept 队列。内核维护两条关键队列：
 
@@ -134,6 +138,10 @@ TCP 有 11 个状态（RFC 793），它们与 socket API 调用关系如下：
 - 队列满时，新 SYN 被直接丢弃或回 RST——**高并发突刺时"连接被拒"的第一嫌疑**就在这里，而不是应用代码。
 
 线上排查连接建立慢/失败时，优先看两个指标：`ss -lnt` 的 `Send-Q`（accept 队列长度）与 `netstat -st` 中 dropped/overflow 计数。同时注意 `tcp_abort_on_overflow` 等 sysctl 的影响。这一层的细节决定了对 [[05-TCP状态机与TIME_WAIT调优]] 的理解深度。
+
+还有一个防御性机制值得单独提：**SYN Cookie**。当 SYN 半连接队列被打满（典型是 SYN flood 攻击）时，内核会把序列号编码成 Cookie 直接回 SYN+ACK，不占半连接队列内存；客户端回 ACK 时根据 Cookie 重建请求。`net.ipv4.tcp_syncookies=1` 通常默认开启（2.6+ 默认 1）。它把"半连接队列满"的拒绝服务，变成"用 CPU 换维持"，是抵御小规模 SYN flood 的第一道防线。在安全视角下，理解 SYN Cookie 与队列溢出，是读懂 DDoS 缓解方案（SYN proxy、SYN cookies、TCP Fast Open）的基础。
+
+### 2.4 阻塞 IO 与 thread-per-connection 的局限
 
 默认情况下，`read`/`accept` 是**阻塞（blocking）**的：`read` 无数据时线程阻塞挂起，`accept` 无连接时阻塞等待。因此最简单可靠的服务端模式是"一连接一线程"：
 
@@ -155,7 +163,7 @@ while (1) {
 
 **阻塞 + 线程池无法支撑高并发**的根本原因是：资源（线程、栈、切换）随连接数**线性增长**，而连接大多是空闲的。解决方案是把"阻塞等待"换成"事件通知"——一个线程管所有连接，谁有数据就处理谁，这便是 IO 多路复用。
 
-### 2.4 非阻塞 IO：EAGAIN 与 EWOULDBLOCK
+### 2.5 非阻塞 IO：EAGAIN 与 EWOULDBLOCK
 
 用 `fcntl(fd, F_SETFL, ... | O_NONBLOCK)` 把 fd 设为非阻塞：
 
@@ -329,6 +337,55 @@ io_uring：    SQ 提交 [read, write] → 内核异步执行 → CQ 返回结�
 
 io_uring 在 NVMe 直连、数据库 IO、以及需要极高吞吐的网关场景逐渐普及；但其异步读写要求对 fd 生命周期与 SO_OOM 等边界状态格外小心，工程复杂度比 epoll 高一个台阶——这也是 nginx/redis 先守住 epoll、逐步迁移 io_uring 的原因。
 
+### 3.8 多线程消费：EPOLLONESHOT 与"读事件归我"
+
+单线程 epoll 把所有就绪事件串行处理，吞吐受单个 CPU 限制。要横向扩展，常见两种模型：
+
+```text
+模型 A（事件循环 + worker 池）：
+  acceptor 线程 ：epoll_wait → 把连接 fd 交给 worker 线程
+  worker 线程   ：对各自 fd 集合再做 epoll_wait
+  → worker 间用 EPOLLONESHOT 避免同一 fd 被两个 worker 同时处理
+
+模型 B（多线程共享一个 epfd + EPOLLEXCLUSIVE）：
+  所有 worker 对同一 epfd epoll_wait，事件只唤醒一个 worker
+  → 使用 EPOLLEXCLUSIVE + EPOLLONESHOT 组合
+```
+
+**EPOLLONESHOT** 的关键作用：一个 fd 产生事件后，内核自动把它从监听集合移除，直到下次 `epoll_ctl(EPOLL_CTL_MOD)` 重新登记。这保证"该 fd 只有且只有一个 worker 在处理"，避免两个线程同时对一条连接读——多线程共享 epfd 时，这是正确性防线。处理完再 MOD 加回去，是常见的"one-shot + requeue"循环：
+
+```c
+/* worker 处理完后重新登记该 fd */
+struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.fd = fd};
+epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+```
+
+### 3.9 超时管理：epoll_wait 的 timeout 与定时器轮
+
+epoll_wait 的 `timeout` 配合定时器轮（最小堆或时间轮）实现连接级超时：
+
+- `epoll_wait(epfd, evs, N, 100)`：每 100ms 醒来一次处理到期定时器，兼顾"及时"与"省电"。
+- 每个连接维护 `last_active`，在主循环统一清扫长时间无活动的 fd（闲置连接踢下线）。这是 Redis idle timeout、网关防呆连接的标准做法。
+
+```c
+for (;;) {
+    int n = epoll_wait(epfd, evs, 128, 100);   /* timeout 100ms */
+    for (int i = 0; i < n; i++) handle(evs[i]);
+    sweep_timeouts(now_ms);                    /* 清扫到期连接 */
+}
+```
+
+宁可统一清扫、也别"每个连接一个定时器线程"堆调度——这又回到 [[05-上下文切换：开销来源与实测分析]] 的核心教训。
+
+### 3.10 事件驱动模型下的锁与可重入
+
+epoll 的单线程事件循环"天然免锁"——因为没有并发读写共享状态。但随着 worker 池化，同一个 fd 的事件可能跨线程处理，于是出现两类新的并发问题：
+
+1. **fd 归属竞争**：两个 worker 同时拿到同一 fd 的读事件（没有 EPOLLONESHOT 时），需要互斥锁或"事件竞拍"来裁决，否则可能出现"半条消息被两个线程各读一半"。
+2. **回调可重入**：事件回调内部若再触发 epoll_ctl MOD 当前事件，可能造成回调嵌套；成熟的框架都会先摘除事件（EPOLLONESHOT/DEL）再处理，处理完再挂回，形成"单向流水线"，保证同一 fd 的处理器在任意时刻唯一。
+
+这些细节解释了为什么"反向体验"里，`redis` 单线程不用锁、`redis-cluster` 分片后 event loop 各自有各的 epfd——**并发边界被设计在"事件循环之外"**，是这类系统能高吞吐的关键。相关同步细节见 [[08-同步原语：互斥锁自旋锁信号量条件变量]]。
+
 ---
 
 ## 4. 实战与示例
@@ -448,7 +505,55 @@ $ wrk -t4 -c1000 -d10s http://127.0.0.1:8080/
 
 `ss -tan` 的状态分布是体检表：`CLOSE_WAIT` 大量堆积 = 服务端漏 close；`TIME_WAIT` 飙升 = 大量短连接主动关闭方；`SYN_SENT` 大量 = 连接建立异常或遭扫描。
 
-### 4.4 用 perf 验证 epoll 的 O(1) 行为
+### 4.4 用 strace 观察 epoll 系统调用（理解"增量管理"）
+
+```bash
+$ strace -f -e trace=epoll_create,epoll_ctl,epoll_wait ./echoserver &
+# 观察输出：
+epoll_create(1024)                          = 3
+epoll_ctl(3, EPOLL_CTL_ADD, 4, {EPOLLIN})   = 0   # 登记 listenfd
+epoll_wait(3, [{EPOLLIN, {u32=4}}], 128, -1) = 1  # 有连接
+epoll_ctl(3, EPOLL_CTL_ADD, 5, {EPOLLIN})   = 0   # 登记新连接 5
+epoll_wait(3, [{EPOLLIN, {u32=5}}], 128, -1) = 1  # 只返回就绪的 5
+```
+
+注意：epoll_ctl 只针对"变化"的 fd 调用（ADD/MOD/DEL），epoll_wait 只返回"就绪"的 fd——这正是"增量管理"与 select"全量拷贝"的根本差异。`strace -p <pid>` 挂到运行中的服务，能一眼看出它是否在事件循环里空转、是否漏了 close。
+
+### 4.5 Go 的 netpoller：同一个 epoll，另一种抽象
+
+Go 用 goroutine 处理每个连接，netpoller 在 Linux 底层就是 epoll：
+
+```go
+package main
+
+import (
+    "fmt"
+    "net"
+)
+
+func handle(c net.Conn) {
+    defer c.Close()
+    buf := make([]byte, 1024)
+    for {
+        n, err := c.Read(buf)        // 底层: epoll_wait 等待该 fd 可读
+        if err != nil { return }
+        fmt.Fprintf(c, "echo: %s", buf[:n])
+    }
+}
+
+func main() {
+    ln, _ := net.Listen("tcp", ":8080")
+    for {
+        c, err := ln.Accept()        // 底层: epoll_wait(listenfd)
+        if err != nil { continue }
+        go handle(c)                 // goroutine 处理, 不占 1 线程
+    }
+}
+```
+
+`go handle(c)` 并不是"一个连接一个 OS 线程"——G 挂念在 netpoll 上，数据到达才被并入 M 运行。goroutine + epoll 的组合，是"语言抽象包装内核机制"的教科书案例，理解本节内容后读 `runtime/netpoll_epoll.go` 会轻松很多。
+
+### 4.6 用 perf 验证 epoll 的 O(1) 行为
 
 ```bash
 # 对比不同连接规模下的 spend
@@ -460,6 +565,8 @@ $ perf stat -e syscalls:sys_enter_epoll_wait syscalls:sys_enter_epoll_ctl ./echo
 ---
 
 ## 5. 常见坑与避坑指南
+
+> 这一节的坑按"上线后事故频次"排序：惊群、ET 漏事件、fd 泄漏排在榜首。它们绝大多数不是"学不会"，而是"错误路径没覆盖"——所以每条都给出"正确写法/巡检手段"，而不只是理论说明。生产代码建议把"连接清理"收口到单一函数，避免多个分支分别 close 造成旁路泄漏。
 
 ### 坑 1：epoll 惊群（Thundering Herd）
 
@@ -524,6 +631,31 @@ epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
 
 **解决**：同机通信优先用 AF_UNIX（不进 IP 栈、天然绕过 netfilter 的大部分路径）；若必须用 127.0.0.1，放行 `lo` 接口。排查时先 `iptables -L`/`nft list ruleset`。
 
+### 坑 8：EPOLLIN 与 EPOLLHUP/EPOLLERR 同时出现时漏 close
+
+**症状**：客户端强制断开（断电/崩溃/RST）时，服务端触发 EPOLLHUP 或 EPOLLERR，但代码只关心 EPOLLIN，导致死连接长期占 fd、CLOSE_WAIT 又涨。
+
+**根因**：当对端异常断开，epoll_wait 返回的事件可能是 `EPOLLIN|EPOLLHUP` 或 `EPOLLERR`。只处理 `EPOLLIN` 的分支会错过清理时机。
+
+**解决**：事件判断用"位与"而非相等，且把 HUP/ERR 视为"必须 close"的信号：
+
+```c
+if (ev->events & (EPOLLHUP | EPOLLERR)) {
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    close(fd);
+    continue;
+}
+if (ev->events & EPOLLIN) { /* 正常可读 */ }
+```
+
+### 坑 9：压测工具本身成为瓶颈
+
+**症状**：`ab`/`wrk` 压到一定并发就"连接失败"，误判服务端有问题。
+
+**根因**：压测客户端是单线程阻塞式、或自身 fd/线程耗尽；客户端成了瓶颈。
+
+**解决**：压测端内存、fd（`ulimit -n`）、并发连接数都要高于被测端一个量级；多客户端分布式压测；对比 `ss -tan` 在服务端看真实连接，而不是只看客户端数字。
+
 ---
 
 ## 6. 知识关联
@@ -535,6 +667,7 @@ epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
 - [[05-上下文切换：开销来源与实测分析]]：线程池模式因上下文切换无法支撑高并发，是 epoll 存在的根本动机。
 - [[08-同步原语：互斥锁自旋锁信号量条件变量]]：多线程/多进程共享 accept 与连接处理时的锁同步与惊群治理。
 - [[04-协程原理：用户态调度与栈管理]]：协程 + epoll 是现代高并发（Go/Node/asyncio）的两大支柱。
+- [[12-中断与异常：中断向量与处理流程]]：网络数据到达依赖网卡中断 → softirq → 协议栈回调，是 epoll 事件链的源头。
 
 ---
 
