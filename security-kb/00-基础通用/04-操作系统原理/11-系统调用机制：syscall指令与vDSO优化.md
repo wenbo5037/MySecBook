@@ -671,6 +671,60 @@ bpftrace -e 'tracepoint:syscalls:sys_enter_execve {
 
 把这些审计能力与 seccomp 白名单结合，就能在一个服务上同时实现"限制 + 观测"的双重安全效果——这正是现代云原生安全（如 Kubernetes sidecar、eBPF 网络安全）的基础。
 
+### 3.10 系统调用：从安全视角看内核攻击面
+
+系统调用是用户态唯一能"直接触达"内核的通道，因而**每个 syscall 都是内核的攻击面**。理解这个攻击面，是理解内核漏洞（CVE）及其缓解方式的基础。
+
+```text
+内核漏洞的分类（按系统调用关联）：
+  ┌────────────────────────────────────────────────┐
+  │ 1. 内存破坏类（memory corruption）              │
+  │    ├─ 栈溢出：覆写 pt_regs 上的返回地址          │
+  │    ├─ 堆溢出：覆写相邻 slab 对象                 │
+  │    ├─ use-after-free：释放后再访问（如 dirty COW）│
+  │    └─ 越界读写：数组/缓冲区下标未校验             │
+  ├────────────────────────────────────────────────┤
+  │ 2. 逻辑错误类（logic bug）                      │
+  │    ├─ 整数溢出/符号错误：size 计算错误            │
+  │    ├─ 竞态条件：syscall 与中断/异步路径竞争        │
+  │    ├─ 引用计数错误：内存泄漏或提前释放            │
+  │    └─ 权限校验缺失：未检查 capabilities          │
+  └────────────────────────────────────────────────┘
+```
+
+**典型的 syscall 相关内核漏洞案例**：
+
+| CVE | 涉及 syscall | 类型 | 影响 |
+|-----|--------------|------|------|
+| CVE-2016-5195 (Dirty COW) | `fork`/`write` | 竞态+ROP | 本地提权至 root |
+| CVE-2017-7308 | `setsockopt` | 越界写 | 本地提权 |
+| CVE-2022-0185 | `fs_context` 相关 | 堆溢出 | 容器逃逸+提权 |
+| CVE-2023-0461 | `io_uring` | 引用计数/UAF | 提权 |
+
+**安全缓解与攻防平衡**：
+
+```text
+攻击视角word vs 防御视角：
+  攻击者：寻找一个可被滥用的 syscall → 构造输入触发 → 提权
+  防御者：seccomp 白名单（缩小可选 syscall 集合）
+          → KASLR（隐藏内核地址）
+          → SMEP/SMAP（阻止 ret2usr/ROP）
+          → KPTI（隔离内核映射）
+          → 模块签名（防止恶意加载）
+
+典型的加固命令：
+  # 限制可用的 syscall 集合（例如只保留基础 I/O）
+  # 见 seccomp 章节
+
+  # 关闭未使用的内核特性（减小攻击面）
+  sysctl kernel.dmesg_restrict=1        # 限制 dmesg 泄露
+  sysctl kernel.kptr_restrict=2         # 限制内核指针泄露
+
+  # 加载 AppArmor/SELinux 并启用强策略
+```
+
+security 视角提醒：**syscall 不是越多越好**。生产中常遵循"最小可用 syscall 集"原则——一个仅做 I/O 的进程不需要 `mount`、`reboot`、`init_module` 等 syscall 权限。seccomp、capabilities、cgroup 三者在现代容器运行时（如 Docker、gVisor）中配合使用，共同把内核攻击面压缩到最小。
+
 ---
 
 ## 4. 实战与示例
