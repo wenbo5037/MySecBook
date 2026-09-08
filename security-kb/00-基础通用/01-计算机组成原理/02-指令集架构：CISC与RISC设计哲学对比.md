@@ -4,7 +4,7 @@ category: "00-基础通用/01-计算机组成原理"
 tags: [ISA, CISC, RISC, 指令集, x86, ARM]
 level: 主攻
 type: ai-generated
-status: 待生成
+status: 完成
 updated: 2026-09-08
 ---
 
