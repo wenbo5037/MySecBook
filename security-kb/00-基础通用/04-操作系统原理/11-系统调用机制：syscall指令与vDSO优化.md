@@ -424,7 +424,97 @@ int main(void) {
 | Docker | 容器默认 seccomp profile | 默认禁止约 44 个 syscall |
 | systemd | 服务级 seccomp 限制 | 可配置白名单/黑名单 |
 
-### 3.5 系统调用 fuzzing 与安全审计
+### 3.5 x86 与 ARM 系统调用路径的对比
+
+理解 x86-64 和 ARM64 系统调用路径的差异，对于编写跨架构安全代码和移植内核模块非常重要。
+
+```text
+x86-64 系统调用路径：
+  用户态：mov rax, nr; mov rdi, arg1; syscall
+          └─ syscall 指令：RIP→RCX, RFLAGS→R11, 从 LSTAR 加载入口
+  内核态：entry_SYSCALL_64（由汇编编写）
+          ├─ swapgs
+          ├─ 压栈所有寄存器到 pt_regs
+          ├─ do_syscall_64() → sys_call_table[nr]()
+          └─ 恢复寄存器，sysret 返回
+
+ARM64 系统调用路径：
+  用户态：mov x8, nr; mov x0, arg1; svc #0
+          └─ svc 指令：从 VBAR_EL1 + offset 加载异常向量入口
+  内核态：el0_svc（异常向量表 entry）
+          ├─ 保存寄存器到 pt_regs
+          ├─ 检查 seccomp/filter
+          ├─ do_el0_svc() → sys_call_table[nr]()
+          └─ 恢复寄存器，eret（Exception Return）返回
+```
+
+**关键差异点**：
+
+| 维度 | x86-64 | ARM64 |
+|------|--------|-------|
+| 触发指令 | `syscall` | `svc #0` |
+| 返回指令 | `sysret` | `eret` |
+| 调用号寄存器 | RAX | X8 |
+| 参数寄存器 | RDI/RSI/RDX/R10/R8/R9 | X0-X5 |
+| 返回值寄存器 | RAX | X0 |
+| 错误约定 | 负值与 4095 之间为 errno | 绝对值 4095 以上为 errno |
+| 最大 syscall 号 | ~3xx | ~4xx |
+
+**ARM64 的错误约定差异**：x86-64 用"负的大值（-errno）"表示错误；ARM64 则使用"最大值介于 -4095 到 -1 之间"的约定（在用户态视作 `0xfffffffffffffxxx`）。`SYSCALL_DEFINEx` 宏在不同架构上生成的返回值处理逻辑不同，这也是为什么不能直接移植汇编级别系统调用代码的原因。
+
+### 3.6 io_uring 与系统调用数量的革命
+
+传统 I/O 模型每个操作都需要一次系统调用（`read`/`write`/`poll`），这在高吞吐场景下会带来大量模式切换。**io_uring**（Linux 5.1+）通过共享内存的提交队列（SQ）和完成队列（CQ）将 I/O 操作批量提交和批量收割，大幅减少系统调用次数。
+
+```text
+io_uring 的工作模式：
+
+传统模式（每个 I/O 一次 syscall）：
+  用户态                       内核态
+  read(fd, buf)  ──syscall──>  处理→阻塞
+  等待 I/O 完成 ←──sysret───   （非常频繁的切换）
+
+io_uring 批量模式：
+  用户态                       内核态
+  [SQE][SQE][SQE]            内核从 SQ 批量取：
+  ↑   提交队列(共享内存)        ├─ 处理 SQE1
+  io_uring_enter()            ├─ 处理 SQE2
+  ↓   （一次 syscall 批量）    ├─ 处理 SQE3
+  [CQE][CQE][CQE]            完成后写 CQ
+  ↑   完成队列(共享内存)        ← 用户态轮询 CQ，无需再进内核
+```
+
+```c
+/* io_uring 的最小示例：批量读 */
+#include <liburing.h>
+#include <fcntl.h>
+
+int main(void) {
+    struct io_uring ring;
+    io_uring_queue_init(8, &ring, 0);  /* 8 个并发条目的队列 */
+
+    int fd = open("/etc/passwd", O_RDONLY);
+    char buf1[256], buf2[256];
+
+    /* 提交两个读请求（只需一次 io_uring_enter） */
+    struct io_uring_sqe *sqe1 = io_uring_get_sqe(&ring);
+    io_uring_prep_read(sqe1, fd, buf1, sizeof(buf1), 0);
+    struct io_uring_sqe *sqe2 = io_uring_get_sqe(&ring);
+    io_uring_prep_read(sqe2, fd, buf2, sizeof(buf2), 128);
+    io_uring_submit(&ring);   /* 一次 syscall 提交两个操作 */
+
+    /* 收割完成（可能无需额外 syscall，轮询 SQ 状态即可） */
+    struct io_uring_cqe *cqe;
+    while (io_uring_peek_cqe(&ring, &cqe) == 0) {
+        io_uring_cqe_seen(&ring, cqe);
+    }
+    return 0;
+}
+```
+
+io_uring 代表了对传统"每操作一次 syscall"模型的重要演进，是 [[13-IO模型演进：select-poll-epoll-io_uring]] 中异步 I/O 的现代实现基础。
+
+### 3.7 系统调用 fuzzing 与安全审计
 
 系统调用是内核攻击面的主要入口，对系统调用进行模糊测试（fuzzing）是发现内核漏洞的重要手段。
 
@@ -518,6 +608,68 @@ void inject_syscall(pid_t child,
 ```
 
 **安全意义**：ptrace 注入是动态分析工具（如系统调用替换、沙箱实现）的基础技术。但同时，ptrace 也是攻击者可能利用的工具——例如，恶意进程可以通过 ptrace 注入修改其他进程的系统调用行为。因此，许多安全机制（如 Docker 的 `--security-opt seccomp=...`）默认禁用 `ptrace` 系统调用。
+
+### 3.8 syscall 安全审计最佳实践
+
+对运行中的进程或服务进行系统调用审计，是识别异常行为、检测恶意软件与做安全加固的重要手段。常见的审计手段与各自的适用场景如下：
+
+```text
+系统调用审计手段对比：
+
+┌─────────────────┬───────────────┬───────────────┬──────────────┐
+│ 手段              │ 观测粒度        │ 性能开销        │ 典型用途      │
+├─────────────────┼───────────────┼───────────────┼──────────────┤
+│ strace          │ 所有 syscall   │ 高（ptrace）   │ 开发调试      │
+│ perf trace      │ 所有 syscall   │ 中（perf）     │ 性能分析      │
+│ auditd          │ 按规则记录      │ 中（内核审计）   │ 合规审计/取证  │
+│ eBPF/bpftrace   │ 精准过滤       │ 低（内核内联）   │ 生产监控/溯源  │
+│ seccomp + log   │ 放行/记录      │ 低             │ 沙箱与降权     │
+└─────────────────┴───────────────┴───────────────┴──────────────┘
+```
+
+**内核审计系统 auditd** 是 Linux 上做合规性系统调用审计的官方机制，常用于等保/PCI-DSS 等合规要求：
+
+```bash
+# 启动 auditd 服务
+systemctl start auditd
+
+# 添加审计规则：记录所有 execve 系统调用
+auditctl -a always,exit -F arch=b64 -S execve -k exec_audit
+
+# 记录所有文件的 open/write 到敏感目录
+auditctl -w /etc/passwd -p wa -k etc_passwd
+
+# 查看审计日志
+ausearch -k exec_audit
+# 输出包括：调用进程、调用者 UID、参数、返回值等
+```
+
+**eBPF 观测** 是生产环境中低开销追踪系统调用的现代方案：
+
+```c
+/* bpftrace 追踪所有 syscall 并统计调用次数 */
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter {
+    @[comm, str(args->args[0])] = count();
+}'
+
+/* 追踪特定进程的 execve 调用（检测进程启动） */
+bpftrace -e 'tracepoint:syscalls:sys_enter_execve {
+    printf("%s pid=%d exec: %s\n", comm, pid, str(args->filename));
+}'
+```
+
+**审计的经典信号**（可用于检测异常/入侵）：
+
+| 信号 | 说明 | 用于检测 |
+|------|------|----------|
+| 非常规 `execve` | 正常程序不会启动 shell | 命令注入、webshell |
+| 非常规 `open` 到敏感路径 | 读取 `/etc/shadow`、内存 dump | 密码破解、取证 |
+| 大量 `mmap` PROT_EXEC | 频繁映射可执行页 | 代码注入、JIT 恶意 |
+| 异常 `socket`/`connect` | 突然建立外向连接 | 数据外传（C2） |
+| `ptrace`/`ptrace attach` | 附加到其他进程 | 调试注入、防检测 |
+| `kill` 大量进程 | 批量终止进程 | DoS、清理痕迹 |
+
+把这些审计能力与 seccomp 白名单结合，就能在一个服务上同时实现"限制 + 观测"的双重安全效果——这正是现代云原生安全（如 Kubernetes sidecar、eBPF 网络安全）的基础。
 
 ---
 
