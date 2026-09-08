@@ -115,7 +115,25 @@ TCP 有 11 个状态（RFC 793），它们与 socket API 调用关系如下：
 - **CLOSE_WAIT**：收到对端 FIN，但本端还没 `close()`。*进程不 close、REPLACEMENT fd 挂 CLOSE_WAIT，是典型的 fd 泄漏症状*——实际排查时，CLOSE_WAIT 持续增长几乎必然意味着代码漏了 close。
 - **TIME_WAIT**：主动关闭方在收到 FIN 后停留 2×MSL（约 60 秒），用于兜底最后一个 ACK 丢失与旧报文失效。高并发短连接下 TIME_WAIT 多是正常现象，无脑调整反而破坏连接语义，详见 [[05-TCP状态机与TIME_WAIT调优]]。
 
-### 2.3 阻塞 IO 与 thread-per-connection 的局限
+### 2.5 三次握手与两条队列：accept 为什么"慢"
+
+三次握手达成后，才进入 accept 队列。内核维护两条关键队列：
+
+```text
+客户端 SYN ──▶  SYN 半连接队列（syn queue / request_sock）
+                  │  完成第三次握手（收到 ACK）
+                  ▼
+                  accept 队列（listen backlog）
+                  │  accept() 取出 → 应用获得 cfd
+                  ▼
+              ESTABLISHED（应用侧）
+```
+
+- `net.ipv4.tcp_max_syn_backlog`（默认 4096）：SYN 半连接队列上限。
+- `net.core.somaxconn`（默认 4096）：accept 队列上限，`listen(backlog)` 会被 clamp 到此值。
+- 队列满时，新 SYN 被直接丢弃或回 RST——**高并发突刺时"连接被拒"的第一嫌疑**就在这里，而不是应用代码。
+
+线上排查连接建立慢/失败时，优先看两个指标：`ss -lnt` 的 `Send-Q`（accept 队列长度）与 `netstat -st` 中 dropped/overflow 计数。同时注意 `tcp_abort_on_overflow` 等 sysctl 的影响。这一层的细节决定了对 [[05-TCP状态机与TIME_WAIT调优]] 的理解深度。
 
 默认情况下，`read`/`accept` 是**阻塞（blocking）**的：`read` 无数据时线程阻塞挂起，`accept` 无连接时阻塞等待。因此最简单可靠的服务端模式是"一连接一线程"：
 
