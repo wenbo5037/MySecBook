@@ -122,6 +122,8 @@ int epoll_wait(int epfd, struct epoll_event *   // 等待事件
                events, int maxevents, int timeout);
 ```
 
+`epoll_create` 创建并返回一个 epoll 实例句柄（epfd）；`epoll_ctl` 通过 `op` 取 `EPOLL_CTL_ADD`（注册）/`EPOLL_CTL_MOD`（修改关注事件）/`EPOLL_CTL_DEL`（注销）来维护要监测的 fd；`epoll_wait` 阻塞等待（可设 timeout，-1 表示永久等待）直到有事件就绪，然后把就绪事件批量填入 `events` 数组返回，返回值是本次就绪的 fd 数量。与 select/poll 每次重新传递整个 fd 集合不同，**epoll 用 epfd 把"要监测的 fd 集合"保存在内核中**，之后 `epoll_wait` 只需等待，无须反复全量拷贝——这是它能支撑百万连接的关键之一。
+
 epoll 的内核实现包含两个关键数据结构：
 
 - **红黑树（Red-black tree）**：以 fd 为键，`epoll_ctl(ADD/MOD/DEL)` 在树中增删改，事件注册是 **O(log n)**；解决"需要添加的 fd 很多"时的开销。
@@ -580,6 +582,28 @@ asyncio.run(main())
 ```
 
 `await reader.read()` 之所以能"挂起而不阻塞线程"，正是因为事件循环把这次读注册进 epoll（监听 EPOLLIN），当 socket 可读时 epoll_wait 返回，事件循环再调度对应协程继续执行。这从工程角度验证了本文反复强调的结论：**多路复用是同步 IO，负责"等待就绪"；真正的数据拷贝仍由 `read`/`write` 系统调用完成**，只是被封装进了 `await` 的语义里。要获得"异步 IO"（数据拷贝由内核完成）的能力，则要依赖 io_uring 或内核 AIO 的封装，这正是 nginx 的 `aio` 指令、以及 Seastar 等框架交给 io_uring 的工作。
+
+### 4.5 事件循环：epoll 之上的通用骨架
+
+理解了本文的模型，就能看懂几乎所有高性能网络框架的骨架——它们本质上都是"**注册事件 → epoll_wait → 分发回调 → 处理就绪 IO**"的循环（event loop）。以一个极简的事件循环为心理模型：
+
+```python
+# Reactor 风格事件循环的伪代码骨架
+def event_loop(epfd, handlers):
+    events = []
+    while running:
+        n = epoll_wait(epfd, events)     # 阻塞等待就绪事件
+        for ev in events[:n]:            # 分发
+            fd, mask = ev.data.fd, ev.events
+            if mask & EPOLLIN:
+                handlers[fd].on_readable()   # 命中页缓存/读事件
+            if mask & EPOLLOUT:
+                handlers[fd].on_writable()
+            if mask & (EPOLLERR | EPOLLHUP):
+                handlers[fd].on_close()
+```
+
+这个骨架回答了"为什么 epoll 是同步、非阻塞"：`epoll_wait` 阻塞的是"等待就绪"，一旦就绪，所有回调都在该线程内同步执行（单线程事件循环天然免锁，这是 Node.js/Redis/nginx 单进程并发的理论基础）。当期望获得**异步完成通知**（如 Seastar 处理海量磁盘 IO）时，才需要切换到 io_uring 的"提交-收割"语义。掌握这种"就绪通知 vs 完成通知"的差异，是选定技术栈的关键判断力。
 
 ---
 
