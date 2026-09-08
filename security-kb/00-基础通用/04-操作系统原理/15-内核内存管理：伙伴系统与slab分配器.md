@@ -328,6 +328,24 @@ $ watch -n 1 "awk '/pgscan_direct|pgsteal_/ {print}' /proc/vmstat"   # 回收计
 
 防御视角的落地建议：生产环境开启 `KASLR`、`CONFIG_SLAB_FREELIST_RANDOM`、`CONFIG_SLAB_FREELIST_HARDENED`、`CONFIG_SLUB_DEBUG`（按需）、`CONFIG_KASAN`（测试环境），并及时打内核安全补丁。
 
+### 3.8 SLAB 与 SLUB 的本源之争
+
+理解 SLAB 与 SLUB 的取舍，比记住"SLUB 是默认"更有价值。两者的设计目标在**教学经典**里常被归为同一概念"slab 对象缓存"，但实现哲学截然不同：
+
+| 维度 | SLAB（老） | SLUB（新，默认） |
+|------|-----------|-----------------|
+| 元数据位置 | 每个 slab 有一个独立的 slab 头/描述结构 | 取消独立 slab 描述，用对象头部的 freepointer 内嵌管理 |
+| per-CPU 队列 | 复杂的三态队列（per-cpu + shared + partial） | 简化为单一 per-CPU freelist |
+| 调试支持 | 有 | 更强（`slub_debug` 支持越界写/越界释放/Redzone 检测等） |
+| 并发性能 | 锁竞争较多 | 无锁快速路径，多核更好 |
+| 代码量/复杂度 | 复杂庞大 | 精简（约 1/3 代码量） |
+
+SLUB 为何能成为默认实现，核心在于它把"slab"这个曾被过度工程化的结构**简化回本质**：对象分配/释放的主要开销转移到了 **CPU 本地 freelist** 上，绝大多数操作无需触碰全局锁。它也顺带降低了 slab 结构本身被攻击者利用的元数据面——freelist 指针内嵌在被回收的对象里，配合 `SLAB_FREELIST_RANDOM`/`HARDENED` 加固后，攻击者想预测 freelist 布局会更困难。这既是性能设计，也是安全设计。
+
+### 3.9 从分配器理解内核内存泄漏
+
+内核模块或驱动若 `kmalloc`/`kmem_cache_alloc` 后忘记 `kfree`/`kmem_cache_free`，就会造成**内核内存泄漏**——它不会像用户态那样随进程退出被回收，而会一直占用直到内核重启。这正是 `/proc/slabinfo`、`slabtop` 被运维重视的原因：一旦某个缓存（如 `kmalloc-*`、`filp`、`dentry`、某驱动自有缓存）的 `active_objs` 只涨不跌，基本就是泄漏信号。`CONFIG_DEBUG_OBJECTS`、`kmemleak`（/sys/kernel/debug/kmemleak）是定位内核泄漏的抓手，本文 4.1/4.2 的观测命令即服务于这一诊断目标。
+
 ---
 
 ## 4. 实战与示例
@@ -458,6 +476,27 @@ $ echo 10 > /proc/sys/vm/swappiness   # 低：更偏好保留文件缓存
 ```
 
 在**交互式/数据库**场景通常调低 swappiness 减少 swap 抖动；在**有大量匿名内存需要**的场合可能需要平衡。理解 swappiness 需要先理解"匿名页 vs 文件页"的区别：文件页（页缓存）可随时丢弃重读，匿名页（进程堆/栈）只能写回 swap——内核正是按这个权衡来决定先回收谁，这本身就是内存回收原理的直接应用。
+
+### 4.7 用 slub_debug 检测内核堆错误
+
+`slub_debug` 是排查内核对象越界写、UAF、double free 的一线工具，主要在**测试/调试内核**上使用（production 慎开，因开销明显）：
+
+```bash
+# 内核命令行（/etc/default/grub 的 GRUB_CMDLINE_LINUX）：
+#   slub_debug=FZPU   # F:freelist 校验 Z:redzone U:全量初始化 P:poison
+# 例：
+GRUB_CMDLINE_LINUX="... slub_debug=FZ"
+
+# 运行中动态开关（部分可用）：
+# echo slub_debug > /sys/kernel/slab/<cache>/...
+# 查看各缓存是否启用 debug：
+$ grep -E '^name|debug=' /sys/kernel/slab/filp/ 2>/dev/null
+
+# 掉用 KASAN 的内核（编译开启 CONFIG_KASAN）在发生越界/越用时
+# 会在 dmesg 直接打出详细的访问报告（地址、调用栈），是回归测试利器。
+```
+
+用 `slub_debug` 时要注意：一旦检测到错误（如 redzone 被破坏），内核会打印详细的 oops 与调用栈，这正是定位"哪个驱动越界写坏了相邻 slab 对象"的关键线索。配合 `CONFIG_KASAN`（测试环境强烈建议）可把越界检测精度提高到**字节级**，是内核安全开发与漏洞修复验证的标准做法。
 
 ---
 

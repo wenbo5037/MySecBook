@@ -407,6 +407,31 @@ inode_cache    23456  24000    512   ...
 - **提升缓存容量**：`/proc/sys/vm/vfs_cache_pressure` 控制 dentry/inode 缓存可被回收的"积极性"——调低可让内核更愿意保留文件缓存。
 - **理解操作代价**：`open` 一个不存在的文件同样要遍历到最后一个非存在目录项；`rm -rf` 海量文件会密集触发 inode 清理与日志写，这是"删大目录慢"的原因。
 
+### 4.7 用 inode 号构建硬链接与查看链接
+
+硬链接与 inode 的关系可以通过 `ln` 与 `ls -i` 直观验证：
+
+```bash
+$ echo "hello" > orig.txt
+$ ls -i orig.txt                # 记录 inode 号，如 262150
+262150 orig.txt
+
+$ ln orig.txt hard.txt          # 创建硬链接（不新建 inode）
+$ ls -i orig.txt hard.txt       # 二者 inode 号相同
+262150 orig.txt  262150 hard.txt
+$ stat -c '%h %i %n' orig.txt hard.txt   # 硬链接数=2，inode 号相同
+
+$ ln -s orig.txt soft.txt       # 创建软链接（新建 inode + 存路径）
+$ ls -li soft.txt               # 软链接有自己独立的 inode 号，且首字符为 l
+    lrwxrwxrwx 1 ... soft.txt -> orig.txt
+
+$ rm orig.txt                   # 删掉原始名
+$ cat soft.txt                  # 软链接悬空 → 报错：No such file or directory
+$ cat hard.txt                  # 硬链接仍可用 → 输出 hello
+```
+
+这段练习把 2.3 节"硬链接共享 inode、软链接存储路径、目标删除后软链接失效"全部落到命令层面。注意 `stat -c` 的 `%h` 打印 nlink、`%i` 打印 inode 号，是排查"文件为什么删不掉/有多少名字指向同一 inode"的利器。
+
 ---
 
 ## 5. 常见坑与避坑指南
