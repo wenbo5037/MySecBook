@@ -533,6 +533,25 @@ $ grep -E '^name|debug=' /sys/kernel/slab/filp/ 2>/dev/null
 
 用 `slub_debug` 时要注意：一旦检测到错误（如 redzone 被破坏），内核会打印详细的 oops 与调用栈，这正是定位"哪个驱动越界写坏了相邻 slab 对象"的关键线索。配合 `CONFIG_KASAN`（测试环境强烈建议）可把越界检测精度提高到**字节级**，是内核安全开发与漏洞修复验证的标准做法。
 
+### 4.8 用 kmemleak 追踪内核对象泄漏
+
+当某一个 slab 缓存的 active 对象只增不减，通常意味着**内核对象泄漏**：某处 `kmalloc`/`kmem_cache_alloc` 后忘记释放，且这些对象既没有被引用也因此无法被回收。`kmemleak` 是内核自带的扫描工具，专门用来找出这类"孤儿对象"及其分配调用栈：
+
+```bash
+# 需要内核编译支持 CONFIG_DEBUG_KMEMLEAK：
+#   debugfs 挂载后查看/触发扫描
+$ mount -t debugfs none /sys/kernel/debug 2>/dev/null
+$ echo scan > /sys/kernel/debug/kmemleak   # 手动触发一次全局扫描
+$ grep -r . /sys/kernel/debug/kmemleak | head -40
+unreferenced object 0xffff88801a000000 (size 4096):
+  comm "insmod", pid 1234, jiffies 4295156821
+  backtrace:
+    [<ffffffff81000000>] __kmalloc+0x1a/0x50
+    [<ffffffffc0000011>] my_driver_init+0x11/0x100 [mydriver]
+```
+
+输出里的 `unreferenced object` 与 backtrace 直接告诉我们：谁、在哪个函数、用哪个分配路径泄漏了对 4KB 的引用。这是把 slab 对象生命周期话题从"概念"推进到"可排查"的关键工具——内核对象泄漏、以及渗透测试里常见的内核内存耗尽型 DOS（泄洪式分配不可释放对象），最终都可以靠这条命令链定位。
+
 ---
 
 ## 5. 常见坑与避坑指南
@@ -547,6 +566,8 @@ $ grep -E '^name|debug=' /sys/kernel/slab/filp/ 2>/dev/null
 | 6 | NUMA 假饥饿 | 默认 node 分配可能使某 node 内存耗尽而其他 node 空闲 | `kmalloc_node` 显式指定；`numactl` 分配策略 |
 | 7 | 忽视 `slub_debug` 关闭 | 生产若开 slub_debug 会显著增加开销并可能轻易 panic | 生产谨慎开，测试/安全加固按需开 |
 | 8 | 堆喷射/溢出利用面 | 未开内核加固时 exploit 难度低 | 开 `SLAB_FREELIST_RANDOM`、`HARDENED`、`KASLR`、KASAN |
+
+值得再强调一条经验法则：排查任何"内核内存不足/诡异崩溃"问题时，**先分清楚是哪个分配器层的症状**。若报错出现在 `__alloc_pages` / `buddyinfo` 高阶分配失败，往往是伙伴系统碎片或 zone 不足；若某个 slab 缓存的 active 对象数异常，则是对象级泄漏；若伴随 `slabtop` 无波动而 `/proc/meminfo` 的 Slab 总量疯涨，则要怀疑是 `vmalloc`/页表自身的开销。这三层（buddy 页 / slab 对象 / vmalloc 映射）各有各的观测命令和排障路径，**不要一上来就祭出 OOM 参数**。把"内存"当成一个三层蛋糕来诊断，比盲目调整 sysctl 有效得多，这也是本文把分配器分层讲透的实用动机之一。
 
 ---
 
