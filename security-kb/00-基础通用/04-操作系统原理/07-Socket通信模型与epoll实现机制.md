@@ -45,6 +45,8 @@ Socket 每次 accept 返回一个新的 fd 代表已建立连接，与监听的 
 
 epoll 用 **红黑树 + 就绪链表 + mmap** 实现了 O(1) 的就绪检测，成为 Linux 高并发服务器的基石。nginx、Redis、libevent、Node.js 的底层事件循环、大量网关都用它。事件驱动模型本身，也直接呼应了 [[05-上下文切换：开销来源与实测分析]] 中"减少切换次数"的优化思想——一个线程用 epoll 管住所有连接，而不是为每个连接开一个线程。
 
+在连接模型上要纠正一个常见误解：**"连接数"不等于"线程数"**。使用 epoll 后，十万连接只需要几十个线程，甚至单线程就能承接——CPU 资源只在"有数据要读写"的瞬间被消耗，空闲连接只占一个 fd 与内核中的少量内存。这就是事件驱动（event-driven）与阻塞式（blocking）两种模型最大的分野。因此衡量一个服务能否支撑高并发，看的不是"连接/线程比"，而是"每个就绪事件的处理时长"与"事件循环是否被阻塞"。若 handler 里出现耗时操作（磁盘、锁、sleep），事件循环会被"抬住"，整个服务的吞吐瞬间垮掉——这是所有基于 epoll 框架的通用铁律。
+
 本节作为 [[13-IO模型演进：select-poll-epoll-io_uring]] 的姊妹篇，重点深入 Socket 抽象、TCP 状态映射、以及 epoll 的内核实现细节。掌握本节之后，读 nginx worker 模型、Redis 单线程事件循环的源码都会有"原来如此"的体验。
 
 ---
@@ -437,4 +439,95 @@ $ perf stat -e syscalls:sys_enter_epoll_wait syscalls:sys_enter_epoll_ctl ./echo
 
 在 100 与 10000 连接下，若 epoll 每轮 `epoll_wait` 只返回就绪 fd，则 syscall 次数不随连接规模线性增长——这就是 O(1) 的实证。而 select 实现会呈现明显的线性上升，两份数据放一起即是对"演进合理性"的最好解释。
 
-<!-- APPEND -->
+---
+
+## 5. 常见坑与避坑指南
+
+### 坑 1：epoll 惊群（Thundering Herd）
+
+**症状**：多进程/多线程都 `epoll_wait` 监听同一 listenfd，一个新连接到达，**所有**等待者都被唤醒，但只有 1 个 accept 成功，其余空转（产生大量无谓调度）。
+
+**根因**：Linux < 4.5 时，多个等待者对同一 fd 的事件会被全部唤醒（水平触发唤醒语义）。
+
+**解决**：
+- 现代 Linux 用 `EPOLLEXCLUSIVE` 标志，保证同一事件只唤醒其中一个等待者。
+- nginx 的经典做法：worker 抢锁或 `SO_REUSEPORT` 让各 worker 分别 bind 同端口，内核负责分配连接。
+
+```c
+ev.events = EPOLLIN | EPOLLEXCLUSIVE;   /* 只唤醒一个 */
+epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
+```
+
+### 坑 2：ET 模式漏事件
+
+**症状**：ET 下偶发"数据到了但没被处理"、连接卡死、吞吐骤降。
+
+**根因**：ET 每次只在边沿通知一次；若没在一次 `epoll_wait` 返回后把 fd 数据**全部读完（读到 EAGAIN）**，剩余数据不再触发通知。
+
+**解决**：ET 下 read 必须循环到 `EAGAIN/EWOULDBLOCK` 为止；或者干脆用 LT（默认），代价只是多一点重复唤醒。**新手默认 LT**，追求极致性能且有纪律的团队再用 ET。
+
+### 坑 3：文件描述符泄漏（fd leak → CLOSE_WAIT 堆积）
+
+**症状**：`ss` 显示 CLOSE_WAIT 持续增长，`/proc/<pid>/fd` 数量爆涨，最终新连接耗光 fd（Too many open files）。
+
+**根因**：对端 FIN 到达后，本端进入 CLOSE_WAIT，但代码没有对该连接 fd 执行 `close`/`epoll_ctl(DEL)`——通常是把"连接读取出错"的清理路径漏写了。
+
+**解决**：读写返回 0 或出错必须唯一走"DEL + close"清理出口；用类封装 fd（RAII）；上线前用 `lsof -p` 与 `ss` 巡检 CLOSE_WAIT 基线。**每个 close 路径都要自测**。
+
+### 坑 4：阻塞 accept 与 epoll 混用丢连接
+
+**症状**：并发突刺时 accept 到一半卡住、后续事件不响应。
+
+**根因**：listenfd 未设非阻塞，而 `accept` 阻塞等待；epoll_wait 返回"有连接"事件后，只 accept 一次就跳出，导致多个待处理连接排队并被后续事件饿死。
+
+**解决**：listenfd 与连接 fd 都设 `O_NONBLOCK`；在事件处理里 `while ((cfd = accept(listenfd,...)) >= 0)` 取尽；对每个新 cfd 也设非阻塞并登记进 epoll。
+
+### 坑 5：SO_LINGER=0 导致 RST 而非 FIN
+
+**症状**：主动 close 的客户端"以为正常关闭"，服务端却收到 RST，数据丢失。
+
+**根因**：`SO_LINGER` 置 `(on=1, linger=0)` 时 close 直接发 RST 而非优雅 FIN；未发完的数据被丢弃。此选项常被误用于"解决 TIME_WAIT"。
+
+**解决**：不要为了消 TIME_WAIT 而乱开 LINGER=0；优雅关闭用默认 FIN 语义，TIME_WAIT 是正常的协议退出成本。若确需"秒关"，也要接受丢尾部数据的风险。
+
+### 坑 6：Nagle 与延迟 ACK 叠加导致的交互延迟
+
+**症状**：交互型应用（小包来回）延迟突然涨几十毫秒，吞吐不高但延迟爆炸。
+
+**根因**：Nagle（攒小包）与对端 delayed ACK（40ms）相互等待形成死锁状延迟——经典"Naggle + delayed ACK"陷阱。
+
+**解决**：对交互请求（登录、命令、RPC）设置 `TCP_NODELAY` 关闭 Nagle；大的流式传输保留默认即可。
+
+### 坑 7：iptables/firewalld 规则误伤本地 loopback
+
+**症状**：本地服务间 AF_INET 通信被防火墙拦（连 127.0.0.1 也失败），`ss -tan` 显示 SYN_SENT 累积。
+
+**根因**：防火墙规则覆盖了 loopback 接口。这也是很多人被误导去"调 TCP 参数"却无效的典型场景。
+
+**解决**：同机通信优先用 AF_UNIX（不进 IP 栈、天然绕过 netfilter 的大部分路径）；若必须用 127.0.0.1，放行 `lo` 接口。排查时先 `iptables -L`/`nft list ruleset`。
+
+---
+
+## 6. 知识关联
+
+- [[13-IO模型演进：select-poll-epoll-io_uring]]：本文是 epoll 层面的深入展开，与之构成"演进全景"，含 io_uring 对比。
+- [[06-进程间通信：管道消息队列共享内存信号]]：AF_UNIX 与网络 Socket 同族，是本机高性能通信的兄弟篇。
+- [[05-TCP状态机与TIME_WAIT调优]]：Socket 编程的 TCP 层基础，CLOSE_WAIT/TIME_WAIT 的技术依托。
+- [[10-内核态用户态：特权级与模式切换]]：read/write/epoll 都经过内核态，理解模式切换成本。
+- [[05-上下文切换：开销来源与实测分析]]：线程池模式因上下文切换无法支撑高并发，是 epoll 存在的根本动机。
+- [[08-同步原语：互斥锁自旋锁信号量条件变量]]：多线程/多进程共享 accept 与连接处理时的锁同步与惊群治理。
+- [[04-协程原理：用户态调度与栈管理]]：协程 + epoll 是现代高并发（Go/Node/asyncio）的两大支柱。
+
+---
+
+## 7. 参考资料
+
+1. Stevens, W. R., Fenner, B., Rudoff, A. M. *UNIX Network Programming, Vol. 1*, 3rd ed., Addison-Wesley, 2003. — Socket API 权威。
+2. RFC 793 — *Transmission Control Protocol*, IETF, 1981. — TCP 状态机与 11 状态。
+3. Kerrisk, M. *The Linux Programming Interface*, No Starch Press, 2010. — epoll、socket、inet 章节。
+4. Linux man-pages：`socket(2)`, `bind(2)`, `listen(2)`, `accept(2)`, `connect(2)`, `epoll_create(2)`, `epoll_ctl(2)`, `epoll_wait(2)`, `SO_REUSEPORT(7)`, `tcp(7)`, `unix(7)`, `ss(8)`, `ab(1)`, `wrk(1)`.
+5. Linux 内核源码：`fs/eventpoll.c`（epoll 实现）、`net/ipv4/tcp.c`、`net/unix/af_unix.c`.
+6. nginx 源码：`src/event/modules/ngx_epoll_module.c`（EPOLLEXCLUSIVE、ET 用法）。
+7. Redis 源码：`src/ae_epoll.c`.
+8. Axboe, J. "io_uring and networking"（io_uring 作者系列博客）。— io_uring 机制与 epoll 对比。
+9. Silberschatz, A. et al. *Operating System Concepts*, 10th ed., Wiley, 2018. — IO 系统与并发服务器章节。
