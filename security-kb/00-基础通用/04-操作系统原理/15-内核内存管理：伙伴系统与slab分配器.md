@@ -573,6 +573,8 @@ unreferenced object 0xffff88801a000000 (size 4096):
 
 ## 6. 知识关联
 
+内核内存管理是所有"上层话题"的地基：进程、文件系统、网络协议栈的每一个对象都从这里取内存。理解它的关联脉络，才能在看其他地方报的内核内存错误时不迷路：
+
 - [[01-物理内存管理：分区分页分段演进史]]：伙伴系统管理的是"页"，而页/分段/分区的演进史正是理解物理内存组织的前提。
 - [[02-虚拟内存原理：多级页表与地址翻译]]：kmalloc 走直接映射、vmalloc 要建页表，都是"物理→虚拟"地址翻译的不同策略；buddy/slab 分配的是物理内存，虚拟地址由其参与建立。
 - [[05-内存页保护属性：从RWX到NX-XD位]]：内核内存与用户内存共享页表保护属性；NX/W^X 等页保护既是内核内存管理的延伸，也是防御堆喷/代码执行的边界。
@@ -582,6 +584,8 @@ unreferenced object 0xffff88801a000000 (size 4096):
 ---
 
 ## 7. 参考资料
+
+下面按"源码 → 专著 → 官方文档 → 手册"四层组织，方便读者从原理到实操逐级深入，也便于在排查具体分配器问题时有书记可查：
 
 - Mel Gorman. *Understanding the Linux Virtual Memory Manager*. Prentice Hall, 2004.（伙伴系统、zone、page allocator 权威著作）
 - Robert Love. *Linux Kernel Development*, 3rd Edition.（slab/slub、kmalloc/vmalloc、OOM 的清晰讲解）

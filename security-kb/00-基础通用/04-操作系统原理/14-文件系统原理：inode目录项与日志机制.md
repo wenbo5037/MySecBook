@@ -75,6 +75,8 @@ VFS 定义了四种核心对象（面向对象思想的内核实现）：
 
 `fd`（文件描述符）→ `struct file`（打开状态，如当前读写偏移 f_pos）→ `struct inode`（文件本体元数据）→ 具体文件系统的 inode 与磁盘块。**重要的是**：`struct file` 是"打开一次"就有一个（同文件打开两次是两个 file），而 `struct inode` 是"一个文件"只有一个（无论打开多少次）。
 
+VFS 还通过每个对象的**操作集（operations）**实现多态：`file_operations`（read/write/mmap/...）、`inode_operations`、`dentry_operations`、`super_operations` 各自是一组函数指针。具体文件系统（ext4/XFS/...）挂上自己的函数实现，VFS 则统一调用——这本质上就是面向对象里的"接口/多态"，只不过用 C 语言的函数指针结构体表达。理解了这一层，再看 `/proc/filesystems` 里的每一种文件系统，就能明白"它们只是给 VFS 提供了不同的操作实现"，而用户看到的接口永远是一致的。
+
 ### 2.2 inode：文件的本体
 
 **inode（index node，索引节点）** 存储一个文件/目录的所有元数据，以及指向数据块的指针。Linux `struct inode` 核心字段：
@@ -526,6 +528,8 @@ $ mount | grep ' / '              # 查看当前 root 的挂载选项含什么
 ---
 
 ## 7. 参考资料
+
+以下资料按"内核源码 → 权威书籍 → 官方文档 → 系统手册"排列，供希望深入 VFS、inode 与日志实现细节的读者按需取用：
 
 - The Linux Kernel Documentation. *Filesystems*（`Documentation/filesystems/*`，VFS 与各文件系统内核文档）
 - Robert Love. *Linux Kernel Development*, 3rd Edition. Addison-Wesley.（VFS、inode、dentry、pdflush/writeback 的系统讲解）
