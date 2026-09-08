@@ -1,49 +1,361 @@
 ---
 title: "文件系统原理：inode目录项与日志机制"
 category: "00-基础通用/04-操作系统原理"
-tags: [文件系统, inode, 日志, JFS]
+tags: [文件系统, inode, VFS, ext4, 日志, 操作系统]
 level: 主攻
 type: ai-generated
-status: 待生成
-updated: 2026-09-08
+status: 完成
+updated: 2025-07-17
 ---
 
 # 文件系统原理：inode目录项与日志机制
+
+> **合规声明**：本文内容用于文件系统原理、底层存储与系统管理的合法工程研究。文中涉及的 inode、VFS、日志（journaling）、文件系统调试均属开发与运维用途。严禁利用本文技术实施未授权数据泄露、文件恢复攻击、畸形文件系统破坏（如故意损坏 superblock）、或利用文件系统漏洞进行提权。涉及内核文件系统漏洞（如 CVE-2019-13272）研究请仅在隔离环境与授权范围进行。
 
 ## 核心速查表
 
 | 维度 | 核心内容 |
 |------|----------|
-| 本质定义 | 待填充 |
-| 核心用途 | 待填充 |
-| 关键参数 | 待填充 |
-| 常见风险 | 待填充 |
-| 关联知识 | 待填充 |
+| 本质定义 | 文件系统是"如何把字节组织成可命名、可检索的持久化数据"的软件层；inode 存元数据与数据块指针，dentry 缓存目录路径解析 |
+| 核心用途 | 持久化存储、目录组织、文件权限/时间戳管理、崩溃恢复（日志）、按需加载（VFS 抽象） |
+| 关键参数 | inode 号/nlink/权限/时间戳/块指针、VFS 四对象（超级块/inode/dentry/file）、日志模式（writeback/ordered/journal） |
+| 常见风险 | 文件删除后空间不释放（fd 被持有）、inode 耗尽（inode 数上限）、日志模式性能/安全取舍、碎片化 |
+| 关联知识 | [[11-系统调用机制：syscall指令与vDSO优化]]、[[02-虚拟内存原理：多级页表与地址翻译]]、[[10-内核态用户态：特权级与模式切换]] |
+
+---
 
 ## 1. 概述
 
-> 待生成
+**文件系统（File System）** 是操作系统中最贴近"人的直觉"、又最容易被当成黑盒的子系统。用户每天 `ls`、`cat`、`mkdir`、删文件，却很少意识到：一个简单的"文件名 → 字节内容"背后，是 VFS 抽象层、inode 元数据、目录项缓存、块分配、日志恢复等一系列精密机制在协同工作。
+
+如果排开硬件，把"持久化存储"理解为"一堆能随机读写的块（block，通常 4KB）"，那么文件系统要回答的其实是四个问题：
+
+1. **元数据放哪**：文件叫什么、多大、谁拥有、什么时候改过、数据块在哪——这由 **inode（索引节点）** 承载。
+2. **文件名和内容的映射**：用户通过路径（`/home/user/a.txt`）访问，路径如何被解析成 inode 号——由 **目录项（dentry）** 与**目录**承载。
+3. **数据块怎么分配**：文件内容散落在哪些磁盘块上，如何高效分配与回收——由 **分配算法**（extents、块组）承载。
+4. **崩溃了怎么办**：写一半断电，文件系统会不会损坏——由**日志（journaling）**机制承载。
+
+从历史看，文件系统演进经历了"简单连续分配 → FAT 的链式分配 → Unix 的多级索引 inode → ext4 的 extent 树 → btrfs 的写时复制（CoW）"这条线。Unix 系文件系统（ext2/ext3/ext4/XFS）共享核心的 **inode + dentry** 骨架，而 Windows 的 NTFS、以及 btrfs/ZFS 则走向了不同的（部分）架构。但无论哪种，**"元数据与数据分离、路径解析走目录树、崩溃需要恢复机制"** 这些核心命题是相通的。
+
+理解文件系统对网络安全同样重要：攻击者常利用"已删除文件仍被进程持有"（space reclamation 陷阱）、"inode 耗尽导致拒绝服务"、恶意构造的畸形文件系统镜像（malicious filesystem image）来触发内核漏洞。本文会兼顾原理、实践与安全视角。
+
+---
 
 ## 2. 核心原理
 
-> 待生成
+### 2.1 VFS：一切文件系统的统一抽象
+
+**VFS（Virtual File System，虚拟文件系统）** 是 Linux 内核在"具体文件系统（ext4/XFS/btrfs/...）"之上提供的一层抽象。它定义了统一的接口，让上层应用用同一套 `open/read/write/close` 系统调用，就能访问磁盘、网络文件系统（NFS）、内存文件系统（tmpfs），甚至伪文件系统（proc/sysfs）——这就是"**一切皆文件**"能够成立的根本原因。
+
+VFS 定义了四种核心对象（面向对象思想的内核实现）：
+
+| VFS 对象 | 对应内核结构 | 代表什么 | 典型字段/方法 |
+|----------|--------------|----------|----------------|
+| **超级块（Superblock）** | `struct super_block` | 一个已挂载的文件系统实例 | `s_fs_info`、`s_blocksize`、`s_dirty` |
+| **索引节点（Inode）** | `struct inode` | 一个文件/目录的全部元数据 | `i_ino`、`i_mode`、`i_uid/gid`、`i_size`、`i_blocks` |
+| **目录项（Dentry）** | `struct dentry` | 路径中的一个名字（目录项） | `d_name`、`d_parent`、`d_inode` |
+| **文件对象（File）** | `struct file` | 一个已打开的文件（含读写位置） | `f_pos`、`f_flags`、`f_op` |
+
+这四个对象的关系大致是：
+
+```text
+进程（files_struct）                VFS 层                     具体文件系统
+┌────────────┐                ┌─────────────────────────┐   ┌────────────┐
+│ fd 表       │                │ struct file (文件对象)  │   │  ext4      │
+│ [0]=stdin   │                │   f_pos 读写位置        │──▶│  xfs       │
+│ [1]=stdout  │──▶ fget ──▶   │   f_flags O_RDWR        │   │  btrfs     │
+│ [2]=stderr  │                │   f_inode──▶struct inode│   │  tmpfs     │
+│ [3]=a.txt   │                │   f_op(文件操作集)       │   └────────────┘
+└────────────┘                └─────────────────────────┘
+```
+
+`fd`（文件描述符）→ `struct file`（打开状态，如当前读写偏移 f_pos）→ `struct inode`（文件本体元数据）→ 具体文件系统的 inode 与磁盘块。**重要的是**：`struct file` 是"打开一次"就有一个（同文件打开两次是两个 file），而 `struct inode` 是"一个文件"只有一个（无论打开多少次）。
+
+### 2.2 inode：文件的本体
+
+**inode（index node，索引节点）** 存储一个文件/目录的所有元数据，以及指向数据块的指针。Linux `struct inode` 核心字段：
+
+```c
+struct inode {
+    umode_t          i_mode;     /* 文件类型 + 权限（rwx + suid/sticky） */
+    kuid_t           i_uid;      /* 属主 UID */
+    kgid_t           i_gid;      /* 属组 GID */
+    loff_t           i_size;     /* 文件逻辑大小（字节） */
+    unsigned long    i_ino;      /* inode 号（在文件系统内唯一） */
+    nlink_t          i_nlink;    /* 硬链接计数（链接数） */
+    struct timespec  i_atime;    /* 访问时间 */
+    struct timespec  i_mtime;    /* 修改时间（内容） */
+    struct timespec  i_ctime;    /* 状态改变时间（元数据） */
+    ...
+    const struct inode_operations *i_op;  /* 操作集 */
+    struct address_space *i_mapping;      /* 页缓存映射 */
+};
+```
+
+**注意 `i_nlink`（link count）**：硬链接每多一个，`i_nlink` 加 1；只有 `i_nlink` 降到 0 且没有进程打开该 inode，文件才会真正被删除（数据块释放）。这就是"删不掉/空间不释放"问题的根源。
+
+inode 在磁盘上的布局经历了演进。**ext2/ext3 的经典"多级索引"** 布局如下：
+
+```text
+inode 数据块指针布局（ext2/传统）：
+┌───────────────────────────────┐
+│ 12 个直接块指针  block[0..11]   │──▶ 直接指向数据块（0-48KB，每块4KB）
+│ 1 个一级间接指针               │──▶ 指向一个块（含 1024 个指针）
+│ 1 个二级间接指针               │──▶ 指向（指向块指针的块）
+│ 1 个三级间接指针               │──▶ 再往上一级
+└───────────────────────────────┘
+单一 inode 可表示的文件上限（4KB 块，4字节指针）：
+  直接：12×4KB = 48KB
+  一级：1024×4KB = 4MB
+  二级：1024×1024×4KB = 4GB
+  三级：1024×1024×1024×4KB = 4TB
+```
+
+这种"12 直接 + 一/二/三级间接"能表示大文件，但**大文件要想访问深处的块要跳多层**（随机访问慢）。**ext4** 引入了 **extent（区段）** 机制，用"起始块号 + 连续块数"来记录连续区段，解决大文件随机访问的开销。
+
+### 2.3 硬链接 vs 软链接
+
+**硬链接（Hard Link）**：给同一个 inode 增加一个目录项（名字）。它**不新建 inode**，只让 `i_nlink++`，两个名字共享同一份数据与元数据。
+
+**软链接（Symbolic Link）**：新建一个独立的 inode，其中存的是"目标路径字符串"。它是一种特殊的"快捷方式"文件。
+
+| 特性 | 硬链接 | 软链接 |
+|------|--------|--------|
+| inode | 与目标共用同一个 inode | 自己的 inode（内容=路径字符串） |
+| `i_nlink` | 目标 inode 计数 +1 | 不变 |
+| 跨文件系统 | **不可以**（inode 号只在同一文件系统内有意义） | 可以 |
+| 链接目录 | 一般不允许（防循环） | 可以 |
+| 目标删除后 | 另一名字仍可用（inode 未删） | **失效**（悬空链接，指向不存在的路径） |
+
+`ls -l` 里文件名字段开头的 **`l`** 表示软链接，`d` 表示目录，`-` 表示普通文件，`b`/`c` 为块/字符设备。
+
+### 2.4 目录：也是文件
+
+**目录（Directory）也是一个文件**，它的 inode 的 `i_mode` 类型是目录，其"数据块"存的是"名字 → inode 号"的目录项列表（`.` 指向自身，`..` 指向父目录）。因此**目录本质上是一张映射表**，映射"文件名 → inode 号"。
+
+**dentry（目录项）缓存**是 VFS 为加速路径解析而在内存中维护的缓存。`open("/home/user/a.txt")` 的路径解析流程：
+
+```text
+open("/home/user/a.txt")
+   │
+   ├─ 查 dentry 缓存（dcache）是否命中整条路径？
+   ├─ 未命中 → 从根 '/' 开始逐级：搜索 '/home' → '/user' → 'a.txt'
+   │    ·'/'：根 inode（挂载点）
+   │    ·'home'：查根目录的目录项 → 得到 home 的 inode
+   │    ·'user'：查 home 目录的目录项 → 得到 user 的 inode
+   │    ·'a.txt'：查 user 目录的目录项 → 得到 a.txt 的 inode
+   │    ·沿途把每个 dentry 放入 dcache
+   └─ 最终通过 inode 找到数据块 → 建立 struct file → 返回 fd
+```
+
+**每打开一个路径都要至少遍历一层目录**，因此 dcache 命中与否对性能影响巨大；频繁的 `open`/`close` 但 dcache 未命中，则会反复扫描目录，这就是为什么"把文件分散到多个目录"能提升性能（减少单目录项数）。
+
+### 2.5 文件分配方法
+
+数据块怎么从磁盘分配并关联到 inode：
+
+| 分配方法 | 原理 | 优点 | 缺点 | 代表 |
+|----------|------|------|------|------|
+| 连续分配 | 文件占用一段连续的块，inode 记录起始块+长度 | 顺序访问快 | 碎片化严重、扩容困难 | 早期 |
+| 链式分配 | 每个块存指向下一块的指针 | 无碎片 | 随机访问慢、指针浪费空间 | FAT |
+| 索引分配 | inode 保存多级指针找到所有块 | 随机访问快、可用大文件 | 间接块跳转、小文件浪费 | ext2/ext3 |
+| **extent 区段** | 记录"起始块+连续长度"的列表 | 大文件连续 IO 高效 | 对碎片敏感 | ext4/XFS |
+
+**ext4 的 extent 树**：在 inode 中用 `extent` 记录连续区段（如"从块 100 开始连续 64 块"）。文件数据过多时 extent 用 B+ 树组织，将区段指针层层下压，实现大文件的高效定位与分配。
+
+---
 
 ## 3. 详细知识点
 
-> 待生成
+### 3.1 ext4 文件系统布局
+
+ext4 把磁盘划分为若干个**块组（Block Group）**，每个块组大致包含：
+
+```text
+ext4 块组布局
+┌────────────────────────────────────────────────────────┐
+│ Group 0:                                              │
+│  [Superblock] [Group Descriptors] [inode bitmap]      │
+│  [block bitmap] [inode table] [data blocks...]        │
+├────────────────────────────────────────────────────────┤
+│ Group 1:  （通常备份 superblock 与 group descriptors） │
+│  ...                                                  │
+└────────────────────────────────────────────────────────┘
+```
+
+- **Superblock（超级块）**：记录整个文件系统的全局信息——块大小、inode 总数/已用、块数、magic（ext4 为 `0xEF53`）、挂载计数、UUID 等。专门在磁盘多处备份以抗损坏。
+- **Group Descriptor（块组描述符）**：记录每个块组的 inode 表位置、bitmap 位置、空闲块/inode 数。
+- **inode/block bitmap（位图）**：一位表示一个 inode/块是否被占用。
+- **inode table（inode 表）**：存放各 inode 结构。
+
+### 3.2 ext4 日志模式
+
+ext4 会把文件操作记录到日志（journal）再落盘，从而在崩溃后能回滚/重放，避免元数据损坏。**三个日志模式**（挂载时 `data=` 指定）：
+
+| 模式 | 记录内容 | 性能 | 数据安全 |
+|------|----------|------|----------|
+| `data=writeback` | 只记**元数据**，数据块可后落盘 | 最快 | 最低（崩溃时数据块可能未落盘或与元数据不一致） |
+| `data=ordered`（默认） | 只记元数据，但**先写数据再写元数据** | 中 | 较高（保证"元数据所指向的块已是新数据"） |
+| `data=journal` | 元数据 + 数据都先写日志 | 最慢 | 最高（写后崩溃文件仍一致） |
+
+`ordered` 是默认的折中：既保证不会出现"元数据更新了但数据没写"的撕裂，又避免数据全写日志的开销。安全敏感场景（如数据库的数据文件目录）可单点换成 `journal` 或交给应用层 fsync 保证。
+
+查看/设置日志模式：
+
+```bash
+tune2fs -l /dev/sda1 | grep -i journal   # 查看日志相关信息
+mount -o data=writeback /dev/sda1 /mnt    # 挂载时指定模式
+```
+
+### 3.3 日志机制的恢复流程
+
+ext3/ext4 的日志（journal）本质上是一块**固定大小、循环使用的区域**。一次典型的提交（checkpoint）流程：
+
+```text
+写日志（Journaling）提交流程：
+1. 事务开始：应用要修改元数据/数据（如 mkdir、写文件元数据）
+2. 把描述块与数据复制进 journal 区（写日志）
+3. 写 commit block（提交标志）
+4. [可选] 把 journal 内容 checkpoint 刷到真实位置（文件系统本体）
+5. 清空该段日志，允许复用
+
+崩溃恢复：
+· 启动时扫描 journal
+· 找到已提交（有 commit block）的事务 → 重放（redo），保证其生效
+· 未提交（无 commit）的事务 → 丢弃（undo），避免半成品写入
+· 由此保证文件系统元数据一致，无需全盘 fsck
+```
+
+这大幅缩短了崩溃后的恢复时间——传统 ext2 需要完整 fsck（文件系统一致性检查，可能数小时），而 ext3+ 只需要回滚日志。**注意**：ordered 模式下数据已先落盘，因此重放日志时数据一致；writeback 模式下重放可能让元数据指向错误数据（但结构一致）。
+
+### 3.4 常见文件系统对比
+
+| 文件系统 | 特点 | 适用场景 |
+|----------|------|----------|
+| **ext4** | 稳定、支持日志、extent、默认 | 通用桌面/服务器 |
+| **XFS** | 高扩展性大文件、延迟分配、日志 | 大数据/海量文件服务器 |
+| **btrfs** | 写时复制（CoW）、快照、校验和、子卷 | 需要快照/压缩的高级场景 |
+| **tmpfs** | 内存承载、掉电丢失、很快 | `/tmp`、`/dev/shm`、容器临时目录 |
+| **proc** | 伪文件系统，反映进程/内核信息 | `/proc/cpuinfo`、`/proc/<pid>/` |
+| **sysfs** | 伪文件系统，反映设备/驱动（kobject） | `/sys/class/`、`/sys/devices/` |
+
+proc/sysfs 不是实体存储，而是内核暴露视图的接口，"读写这些文件就是与内核交互"。
+
+### 3.5 文件描述符与 fd 共享
+
+`struct files_struct`（进程的 fd 表）是 **fd → struct file*** 的数组。三个与 fd 共享相关的关键机制：
+
+| 机制 | 行为 | fd 共享？ |
+|------|------|-----------|
+| `dup`/`dup2` | 复制 fd，指向**同一个** `struct file`（共享 f_pos） | 同一进程内共享底层 file |
+| `fork` | 子进程**复制一份 fd 表**，但每一项指向同一组 `struct file`（共享偏移） | 父子共享底层 file |
+| 共享打开（`open` 两次） | 两个不同 `struct file`，各有 f_pos | 不共享 |
+
+`fork()` 后父子进程读写同一 fd，若都移动位置会互相影响（共享 f_pos），这是经典的多进程文件处理陷阱。而 `O_APPEND` 通过内核原子性解决并发追加时的位置竞争。
+
+---
 
 ## 4. 实战与示例
 
-> 待生成
+### 4.1 用 stat 查看文件 inode 元数据
+
+```bash
+$ stat /etc/hostname
+  文件：/etc/hostname
+  大小：13         块：8          IO 块：4096   普通文件
+设备：fd00h/64768d  Inode: 262150      硬链接：1
+权限：(0644/-rw-r--r--)  Uid：(    0/    root)   Gid：(    0/    root)
+最近访问：2025-07-16 12:00:00 ...
+最近更改：2025-07-01 09:30:00 ...
+最近改动：2025-07-01 09:30:00 ...
+```
+
+字段解读：`Inode` 是 inode 号（262150），`硬链接` 是 `i_nlink`，`IO 块` 反映块大小，权限位 0644 来自 `i_mode`。`ls -i` 也可直接看 inode 号。
+
+### 4.2 用 strace 跟踪文件系统系统调用
+
+```bash
+$ echo hello > /tmp/test.txt
+$ strace -e trace=openat,read,write,close,fsync cat /tmp/test.txt
+
+openat(AT_FDCWD, "/tmp/test.txt", O_RDONLY) = 3   # 打开成功返回 fd=3
+fstat(3, {st_ino=12345, st_mode=...}) = 0          # 读 inode 元数据
+read(3, "hello\n", 131072) = 6                     # 读 6 字节
+write(1, "hello\n", 6) = 6                         # 写到 stdout
+close(3) = 0
+```
+
+这正是 VFS/"一切皆文件"在系统调用层的体现：`cat` 对普通文件与对 `/dev/stdin` 走同一套 `openat/read/write/close`。
+
+### 4.3 演示"文件删不掉/空间不释放"（fd 仍被持有）
+
+```bash
+# 场景：大文件被打开，随即 unlink，但进程仍持有 fd
+$ dd if=/dev/zero of=/tmp/big bs=1M count=100
+$ sleep 1000 < /tmp/big &          # 后台进程打开 big 并持有 fd
+$ rm /tmp/big                       # unlink 成功，但空间未释放
+$ df -h; lsof +L1 | grep /tmp/big  # lsof 显示 deleted 但仍 open
+```
+
+删除文件只是把目录项移除、`i_nlink--`；只要 `i_nlink>0` 或仍有进程持有 `struct file`，inode 与其数据块就不会被真正释放。修复：`kill` 持有 fd 的进程，空间即回收。
+
+### 4.4 inode 耗尽演示与排查
+
+```bash
+# inode 耗尽：小文件海量时可能 inode 先于空间耗尽
+$ df -i /                        # 查看 inode 使用率（IUsed/IFree）
+$ find / -xdev -type f | wc -l   # 统计文件数
+$ tune2fs -O ^dir_index /dev/sda1  # （仅示例，勿随意执行）调整索引
+
+# 排查谁占满了 inode：定位"说明是含海量小文件的目录"
+$ du --inodes -d 2 /path 2>/dev/null | sort -n | tail -20
+```
+
+当一个文件系统 inode 数耗尽，即使还有磁盘空间也无法再创建新文件——这是测试环境常见的坑。
+
+### 4.5 ext4 调试命令
+
+```bash
+dumpe2fs /dev/sda1            # 查看 superblock 与块组信息
+tune2fs -l /dev/sda1          # 查看文件系统参数（含日志信息、mount count）
+fsck.ext4 -n /dev/sda1        # 只读检查文件系统一致性（不要随意 -y）
+debugfs -R "stat <inode号>" /dev/sda1   # 深入查看 inode 结构
+```
+
+`debugfs` 是分析 inode 布局、恢复被删文件的专家工具（仅用于授权取证场景）。
+
+---
 
 ## 5. 常见坑与避坑指南
 
-> 待生成
+| # | 坑点 | 说明 | 避坑方法 |
+|---|------|------|----------|
+| 1 | 文件删除后空间不释放 | 进程仍持有 fd（`rm` 只减 `i_nlink`，未到 0） | `lsof +L1` 找出持 fd 的进程并 kill |
+| 2 | inode 耗尽 | 海量小文件把 inode 表用尽，磁盘还有空间 | `df -i` 监控；创建时预留 inode；必要时 `mkfs -i` 调大 inode:block 比 |
+| 3 | fsync 依赖 | 以为 `write` 后数据已落盘，断电丢失 | 需要持久性时显式 `fsync`/`fdatasync`；交给日志或应用层保证 |
+| 4 | 硬链接跨文件系统失败 | inode 号只在单一文件系统内唯一 | 跨盘用软链接或复制 |
+| 5 | 日志模式选择不当 | writeback 快但数据可能不一致 | 默认 ordered；数据敏感目录用 journal + 应用 fsync |
+| 6 | 并发 fd 偏移竞争 | fork/dup 共享 f_pos，多进程写互相覆盖 | 用 `O_APPEND`、`pwrite`/`pread`（不移动 f_pos）或加锁 |
+| 7 | 掉电后文件为空 | ordered 下元数据合法但数据可能未全写完 | 需要强一致用 journal + fsync；或用数据库自己的事务 |
+| 8 | 反复遍历巨型目录 | 单目录放数十万文件，dcache 未命中时 O(n) 扫描 | 按哈希/日期分目录，减少单目录项 |
+
+---
 
 ## 6. 知识关联
 
-> 待生成
+- [[11-系统调用机制：syscall指令与vDSO优化]]：一切文件操作（open/read/write/fsync）都通过系统调用进入内核 VFS，理解 syscall 才能理解文件 IO 的用户态/内核态边界。
+- [[02-虚拟内存原理：多级页表与地址翻译]]：文件数据通过**页缓存（page cache）**与内存页映射，文件 IO 与虚拟内存通过 mmap 直接交织，二者是同一存储介质的两个视图。
+- [[10-内核态用户态：特权级与模式切换]]：VFS 与具体文件系统实现运行在内核态，用户通过系统调用进入；模式切换是文件 IO 性能开销的一部分。
+- [[01-物理内存管理：分区分页分段演进史]]：文件系统把数据组织到磁盘，内存把数据组织到页，两者在页缓存"页面"上汇合（writeback 的脏页回收）。
+
+---
 
 ## 7. 参考资料
 
-> 待生成
+- The Linux Kernel Documentation. *Filesystems*（`Documentation/filesystems/*`，VFS 与各文件系统内核文档）
+- Robert Love. *Linux Kernel Development*, 3rd Edition. Addison-Wesley.（VFS、inode、dentry、pdflush/writeback 的系统讲解）
+- Daniel P. Bovet & Marco Cesati. *Understanding the Linux Kernel*, 3rd Edition. O'Reilly.（VFS 文件系统与块 IO 的深度源码解读）
+- [ext4 内核文档](https://www.kernel.org/doc/html/latest/filesystems/ext4/)、`tune2fs(8)`/`dumpe2fs(8)`/`debugfs(8)`/`stat(1)`/`lsof(8)` 手册
+- ext4 cross-reference：`Documentation/filesystems/ext4/`（superblock、inode layout、extent 树的官方说明）
+- 参考资料：Andrew S. Tanenbaum. *Modern Operating Systems*, 4th Edition, Chapter 4 "File Systems"（文件系统经典教科书内容）
+- [Filesystems HOWTO](https://tldp.org/HOWTO/Filesystems-HOWTO-1.html)、Linux Filesystem Hierarchy Standard (FHS)
