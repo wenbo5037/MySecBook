@@ -7,7 +7,6 @@ type: ai-generated
 status: 完成
 updated: 2026-09-09
 ---
-
 # TCP流量控制：滑动窗口与零窗口探测
 
 > **合规声明**：本文涉及的攻防技术仅用于授权测试与学习研究，禁止用于任何未授权目标。
@@ -15,7 +14,7 @@ updated: 2026-09-09
 ## 核心速查表
 
 | 维度 | 核心内容 |
-|------|----------|
+| --- | --- |
 | 本质定义 | 滑动窗口是TCP端到端**流量控制**（flow control）机制，防止发送方淹没接收方缓冲区；零窗口是指接收方通告窗口为0、发送方停止发送的状态 |
 | 核心用途 | 协调收发双方处理能力差异；窗口缩放应对高速网络；零窗口探测维持连接活性；防止接收缓冲区溢出 |
 | 关键参数 | 发送窗口SWND、接收窗口RWND、通告窗口Advertised Window、窗口缩放因子Wscale、SWS阈值、持续计时器Persist Timer |
@@ -33,6 +32,7 @@ TCP滑动窗口（Sliding Window）是TCP协议中用于**端到端流量控制*
 ### 1.2 知识体系定位
 
 在TCP协议栈中，滑动窗口位于传输层的**可靠传输**与**流量控制**领域，与三次握手、重传机制、拥塞控制并列，构成TCP可靠性四大支柱：
+
 - **连接管理**：三次握手、四次挥手（见 [[07-TCP三次握手四次挥手：逐包状态分析]]）
 - **可靠传输**：确认号、超时重传、快速重传
 - **流量控制**：滑动窗口、窗口缩放、零窗口处理（本文）
@@ -48,7 +48,7 @@ TCP滑动窗口（Sliding Window）是TCP协议中用于**端到端流量控制*
 ### 1.4 技术演进简史
 
 | 时间 | 里程碑 | 说明 |
-|------|--------|------|
+| --- | --- | --- |
 | 1974 | 论文《A Protocol for Packet Network Intercommunication》 | 滑动窗口思想由Vint Cerf与Bob Kahn提出 |
 | 1981 | RFC 793 | TCP正式定义16位窗口字段，最大65535字节 |
 | 1984 | Nagle算法（RFC 896） | 解决小包问题 |
@@ -63,7 +63,7 @@ TCP滑动窗口（Sliding Window）是TCP协议中用于**端到端流量控制*
 TCP流量控制涉及三个核心窗口概念：
 
 | 概念 | 英文 | 含义 | 决定者 |
-|------|------|------|--------|
+| --- | --- | --- | --- |
 | 接收窗口 | RWND (Receive Window) | 接收方尚未读取、可接纳的字节数 | 接收方 |
 | 通告窗口 | AWND (Advertised Window) | 通过ACK报文通告给发送方的RWND值 | 接收方 |
 | 发送窗口 | SWND (Send Window) | 发送方允许一次在途发送的字节上限 | 发送方 |
@@ -88,6 +88,7 @@ TCP流量控制涉及三个核心窗口概念：
 ```
 
 滑动窗口是"三段式"：
+
 1. **已发送并已确认**（窗口左侧滑出）
 2. **已发送未确认**（窗口内部，等待ACK）
 3. **未发送但允许发送**（窗口内可用空间）
@@ -153,6 +154,7 @@ TCP Option Kind=3 (Window Scale), Len=3, Shift count=7
 - 发送方收到ACK后，SND.UNA右移，窗口右缘随之右移。这就是"滑动"。
 
 **窗口推进的三种可能**：
+
 - ACK字节号 > SND.UNA：窗口**正向滑动**（normal）
 - ACK窗口值 > 0：窗口**扩张**
 - ACK窗口值 < 上次：窗口**收缩**（shrink，应避免——RFC 1122 建议接收方不要收缩窗口，可能导致混乱）
@@ -208,15 +210,18 @@ class NagleSender:
 **触发条件**：发送方收到 AWND=0 的ACK。
 
 **机制**：进入持续发送循环：
+
 1. 启动Persist Timer（指数退避：初始约1.5s~2.0s，倍增至最大60s，上限约10-11次）
 2. 到期后发送**1字节**的探测段（零窗口探测段，ZWP）
 3. 探测段触发接收方必须回ACK，其中携带当前AWND
 4. 若AWND仍为0，继续退避探测；若>0，恢复数据传输
 
 **探测包抓包特征**（tcpdump）：
-```
+
+```typescript
 14:03:22.111111 IP 10.0.0.1.54321 > 10.0.0.2.80: Flags [P.], seq 500:501, ack 200, win 1460, length 1
 ```
+
 单字节载荷、win字段代表发送方对接收方的通告窗口。
 
 ```bash
@@ -267,7 +272,7 @@ print(bdp_and_scale(100e6, 0.05)) # 百兆网50ms  -> (625000.0, 4)
 
 ### 4.1 环境准备
 
-使用Linux为主（若Windows需以WSL或虚拟机运行）：
+使用Linux为主（若Windows需以WSL或虚拟机运行）： 
 
 ```bash
 # 环境: Ubuntu 20.04+ / CentOS 7+
@@ -326,6 +331,7 @@ s.send(b'x' * 65536)  # 一次性填满接收缓冲
 ```
 
 抓包观察：
+
 ```
 # 窗口缩到0后, 每 ~1.5s~60s 出现一次 length=1 的探测段
 tcpdump -i lo -nn -A 'tcp port 9999' | grep -E 'seq|win'
@@ -357,7 +363,7 @@ sudo sysctl -w net.ipv4.tcp_window_scaling=1
 ### 4.5 报错与解决
 
 | 现象 | 原因 | 解决 |
-|------|------|------|
+| --- | --- | --- |
 | `tcpdump: no suitable device found` | 权限不足/设备未指定 | 加 `sudo`，确认 `-i` 网卡名 |
 | 窗口值看起来<64K不增长 | 忘了看缩放因子 | 用 `tcp.window_size_scalefactor` 字段，实际窗口=value<<shift |
 | 传输卡死、无进展迹象 | 零窗口持久僵持 | 查看双方是否在交换ZWP；检查应用是否停止读socket |
@@ -366,15 +372,10 @@ sudo sysctl -w net.ipv4.tcp_window_scaling=1
 ## 5. 常见坑与避坑指南
 
 1. **混淆流量控制与拥塞控制**：流量控制是"接收方说慢点"，拥塞控制是"网络说慢点"。实际发送窗口 = `min(cwnd, rwnd)`，两者都会限制发送。排查瓶颈时要同时看两个窗口，很多新手只盯rwnd却忽略cwnd。
-
 2. **窗口缩放只在SYN中协商**：Wscale一旦在三次握手中确定就固定。若抓包发现某连接Wscale=0，则该连接最高窗口=64KB，高速传输必然受限。诊断高带宽链路吞吐不足时先检查这个。
-
 3. **零窗口更新ACK不可靠**：纯ACK不重传，窗口更新可能"无痕丢失"。这是设计使然，也解释了为何需要Persist Timer。安全上，攻击者可以利用这一点进行DoS（见下）。
-
 4. **Nagle与延迟ACK叠加的延迟**：交互式和实时应用（SSH、游戏、RPC）必须 `TCP_NODELAY`，否则200-400ms延迟灾难。但同时，大批量传输不要滥用NODELAY，否则碎片化。
-
 5. **窗口收缩（Window Shrink）**：不建议接收方动态收缩已通告窗口，会导致发送方数据超窗、行为不确定。RFC 1122规定接收方不应收缩窗口。
-
 6. **安全坑：零窗口DoS与窗口操纵**：
    - 攻击者可伪造接收方通告AWND=0（发起方受害）或大量创建零窗口连接占资源，形成DoS。
    - 中间人可篡改ACK中的窗口字段，任意增大/减小窗口：增大导致接收缓冲区溢出、数据丢失；减小导致吞吐下降。
@@ -383,7 +384,7 @@ sudo sysctl -w net.ipv4.tcp_window_scaling=1
 ## 6. 知识关联
 
 - [[07-TCP三次握手四次挥手：逐包状态分析]] —— 滑动窗口参数（SYN携带Wscale、MSS）在握手阶段协商，与本文衔接
-- [[08-TCP状态机与TIME_WAIT调优]] —— 连接生命周期与窗口收尾，探讨大窗口环境的TIME_WAIT资源占用
+- ‹WIKILINK:ENC:08-TCP%E7%8A%B6%E6%80%81%E6%9C%BA%E4%B8%8ETIME*WAIT%E8%B0%83%E4%BC%98› —— 连接生命周期与窗口收尾，探讨大窗口环境的TIME*WAIT资源占用
 - [[10-TCP拥塞控制：从Reno到BBR算法演进]] —— cwnd与rwnd共同决定发送窗口，拥塞控制是另一大支柱
 - [[01-OSI与TCP-IP分层模型：封装解封装全流程]] —— 传输层在整个栈中的位置
 - [[16-抓包实战：tcpdump过滤与Wireshark协议还原]] —— 如何用tcpdump/Wireshark观察window字段与ZWP
@@ -391,7 +392,7 @@ sudo sysctl -w net.ipv4.tcp_window_scaling=1
 ## 7. 参考资料
 
 | 类型 | 资源 | 说明 |
-|------|------|------|
+| --- | --- | --- |
 | RFC | [RFC 793 - Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc793) | TCP基础，滑动窗口原始定义 |
 | RFC | [RFC 1122 - Requirements for Internet Hosts](https://www.rfc-editor.org/rfc/rfc1122) | 延迟ACK、窗口收缩规则、SWS规避 |
 | RFC | [RFC 896 - Congestion Control in IP/TCP](https://www.rfc-editor.org/rfc/rfc896) | Nagle算法 |
