@@ -117,7 +117,7 @@
     "version": 1
   },
   "mcp.selectedServerIds": [],
-  "rerankingModel": "",
+  "rerankingModel": "573ca2f9-eece-42d3-a4b5-42f0f2ae5f4d",
   "currentPromptId": "0",
   "customThemeColors": {
     "dark": {
