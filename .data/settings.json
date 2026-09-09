@@ -1,0 +1,445 @@
+{
+  "gitlabUsername": "",
+  "editorModel": "note-gen-vlm",
+  "editorSourceWrap": true,
+  "canvasWheelBehavior": "zoom",
+  "giteeAutoSync": "disabled",
+  "githubUsername": "wenbo5037",
+  "jsdelivr": true,
+  "outlinePosition": "right",
+  "gitlabAutoSync": "disabled",
+  "agentPermissionMode": "ask",
+  "editorShortcuts": [
+    {
+      "id": "undo",
+      "value": "Mod+Z"
+    },
+    {
+      "id": "redo",
+      "value": "Shift+Mod+Z"
+    },
+    {
+      "id": "setParagraph",
+      "value": "Mod+Alt+0"
+    },
+    {
+      "id": "toggleHeading1",
+      "value": "Mod+Alt+1"
+    },
+    {
+      "id": "toggleHeading2",
+      "value": "Mod+Alt+2"
+    },
+    {
+      "id": "toggleHeading3",
+      "value": "Mod+Alt+3"
+    },
+    {
+      "id": "toggleHeading4",
+      "value": "Mod+Alt+4"
+    },
+    {
+      "id": "toggleHeading5",
+      "value": "Mod+Alt+5"
+    },
+    {
+      "id": "toggleHeading6",
+      "value": "Mod+Alt+6"
+    },
+    {
+      "id": "openSearch",
+      "value": "Mod+F"
+    },
+    {
+      "id": "openSlashCommand",
+      "value": "Mod+/"
+    },
+    {
+      "id": "toggleOutline",
+      "value": "Shift+Mod+O"
+    },
+    {
+      "id": "toggleBold",
+      "value": "Mod+B"
+    },
+    {
+      "id": "toggleItalic",
+      "value": "Mod+I"
+    },
+    {
+      "id": "toggleStrike",
+      "value": "Shift+Mod+S"
+    },
+    {
+      "id": "toggleUnderline",
+      "value": "Mod+U"
+    },
+    {
+      "id": "toggleInlineCode",
+      "value": "Mod+E"
+    },
+    {
+      "id": "toggleHighlight",
+      "value": "Shift+Mod+H"
+    },
+    {
+      "id": "openLinkInput",
+      "value": "Mod+K"
+    },
+    {
+      "id": "toggleBlockquote",
+      "value": "Shift+Mod+B"
+    },
+    {
+      "id": "toggleBulletList",
+      "value": "Shift+Mod+8"
+    },
+    {
+      "id": "toggleOrderedList",
+      "value": "Shift+Mod+7"
+    },
+    {
+      "id": "toggleTaskList",
+      "value": "Shift+Mod+9"
+    },
+    {
+      "id": "toggleCodeBlock",
+      "value": "Mod+Alt+C"
+    },
+    {
+      "id": "openAiMenu",
+      "value": "Mod+J"
+    },
+    {
+      "id": "aiContinue",
+      "value": "Shift+Mod+J"
+    },
+    {
+      "id": "aiPolish",
+      "value": ""
+    },
+    {
+      "id": "aiConcise",
+      "value": ""
+    },
+    {
+      "id": "aiExpand",
+      "value": ""
+    },
+    {
+      "id": "aiTranslate",
+      "value": ""
+    },
+    {
+      "id": "acceptAiSuggestion",
+      "value": "Mod+Enter"
+    },
+    {
+      "id": "rejectAiSuggestion",
+      "value": "Escape"
+    },
+    {
+      "id": "abortAiGeneration",
+      "value": "Mod+."
+    },
+    {
+      "id": "insertTable",
+      "value": "Mod+Alt+T"
+    },
+    {
+      "id": "addColumnBefore",
+      "value": ""
+    },
+    {
+      "id": "addColumnAfter",
+      "value": ""
+    },
+    {
+      "id": "addRowBefore",
+      "value": ""
+    },
+    {
+      "id": "addRowAfter",
+      "value": ""
+    },
+    {
+      "id": "deleteColumn",
+      "value": ""
+    },
+    {
+      "id": "deleteRow",
+      "value": ""
+    },
+    {
+      "id": "deleteTable",
+      "value": ""
+    },
+    {
+      "id": "alignLeft",
+      "value": "Shift+Mod+L"
+    },
+    {
+      "id": "alignCenter",
+      "value": "Shift+Mod+E"
+    },
+    {
+      "id": "alignRight",
+      "value": "Shift+Mod+R"
+    },
+    {
+      "id": "insertImage",
+      "value": "Shift+Mod+I"
+    },
+    {
+      "id": "insertInlineMath",
+      "value": "Mod+Alt+M"
+    },
+    {
+      "id": "insertBlockMath",
+      "value": "Shift+Mod+Alt+M"
+    },
+    {
+      "id": "insertMermaid",
+      "value": "Mod+Alt+D"
+    },
+    {
+      "id": "insertHorizontalRule",
+      "value": "Mod+Alt+-"
+    }
+  ],
+  "showEditorStats": true,
+  "version": "0.36.0",
+  "imageMethodModel": "note-gen-chat",
+  "canvasMinimapVisible": true,
+  "sttModel": "d9f183f8-4abe-4abe-9a21-d875963b96d4",
+  "recordViewMode": "list",
+  "shortcuts": [
+    {
+      "key": "openWindow",
+      "value": "CommandOrControl+Shift+W"
+    },
+    {
+      "key": "screenshotRecord",
+      "value": "CommandOrControl+Shift+S"
+    },
+    {
+      "key": "quickRecordText",
+      "value": "CommandOrControl+Shift+T"
+    }
+  ],
+  "mcp.servers": [
+    {
+      "args": [
+        "C:\\Program Files\\nodejs\\node_global\\node_modules\\@modelcontextprotocol\\server-filesystem\\dist\\index.js",
+        "D:\\MySecBook"
+      ],
+      "command": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAt": 1788940196052,
+      "enabled": true,
+      "id": "mcp-1788940196052-5h8yjaw",
+      "lastConnected": 1788940196258,
+      "name": "local-files",
+      "type": "stdio"
+    },
+    {
+      "args": [
+        "C:\\Program Files\\nodejs\\node_global\\node_modules\\@modelcontextprotocol\\server-filesystem\\dist\\index.js",
+        "D:\\MySecBook"
+      ],
+      "command": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAt": 1788941608002,
+      "enabled": true,
+      "id": "mcp-1788941608002-ndxertf",
+      "lastConnected": 1788941608206,
+      "name": "filesystem",
+      "type": "stdio"
+    },
+    {
+      "args": [
+        "C:\\Program Files\\nodejs\\node_global\\node_modules\\@modelcontextprotocol\\server-memory\\dist\\index.js"
+      ],
+      "command": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAt": 1788941608002,
+      "enabled": true,
+      "id": "mcp-1788941608002-k2dmb7b",
+      "lastConnected": 1788941608351,
+      "name": "memory",
+      "type": "stdio"
+    }
+  ],
+  "mcp.selectedServerIds": [],
+  "placeholderModel": "",
+  "enableImageRecognition": true,
+  "recordSaveTargetMode": "current",
+  "canvasGridVisible": true,
+  "recordSortMode": "newest",
+  "canvasDefaultZoom": 1,
+  "autoUpdate": true,
+  "enableOutline": true,
+  "completionModel": "note-gen-chat",
+  "darkMode": "system",
+  "editorWorkspaceLayout:main": {
+    "activeGroupId": "editor-group-36c80cd7-a1a5-45af-9973-57d34e1dbf20",
+    "groups": {
+      "editor-group-36c80cd7-a1a5-45af-9973-57d34e1dbf20": {
+        "activeTabId": "1788938497506-1j2sm4j0s",
+        "id": "editor-group-36c80cd7-a1a5-45af-9973-57d34e1dbf20",
+        "tabIds": [
+          "1788938497506-1j2sm4j0s"
+        ]
+      }
+    },
+    "root": {
+      "groupId": "editor-group-36c80cd7-a1a5-45af-9973-57d34e1dbf20",
+      "id": "editor-node-7a26df6e-e2bf-43c5-bf57-a4f081c476b9",
+      "type": "group"
+    },
+    "version": 1
+  },
+  "autoSync": "5",
+  "recordTextSize": "sm",
+  "showEditorUndoRedo": true,
+  "giteaAutoSync": "disabled",
+  "markDescModel": "note-gen-chat",
+  "promptList": [
+    {
+      "content": "请你扮演一个笔记软件的智能助手，可以参考记录内容，使用 markdown 语法，回答用户的问题。",
+      "id": "0",
+      "isDefault": true,
+      "title": "写作助手"
+    },
+    {
+      "content": "# Role: 网络安全专家 & 个人知识库架构师\n\n## Profile\n你是一位精通二进制安全、AI安全、红蓝对抗及物联网安全的资深安全研究员，同时也是一位擅长代码审计与安全开发的全栈工程师。你对云计算运维有扎实基础，并热衷于通过数据分析和软件开发来解决问题。你的核心任务是协助用户（一位高级安全研究员）在 NoteGen 中构建结构化、深度的安全知识体系。\n\n## Core Competencies\n1. **核心领域**：二进制漏洞挖掘与利用、AI模型安全性与对抗样本、红蓝对抗战术与防御、IoT固件分析与协议逆向。\n2. **扩展领域**：Web渗透测试、源代码审计（C/C++/Python/Go等）、安全工具开发、DevSecOps。\n3. **辅助技能**：Linux/Cloud运维、数据分析（Python/Pandas/SQL）、项目架构设计。\n4. **知识管理**：擅长将碎片化信息转化为结构化的 Markdown 笔记，构建双向链接和知识图谱。\n\n## Guidelines for Interaction\n\n### 1. 回答风格\n- **深度优先**：在涉及安全原理时，不要只给表面解释。深入底层机制（如内存布局、汇编指令、模型权重影响），提供技术细节。\n- **实战导向**：结合 CTF 场景或真实 CVE 案例进行说明，避免纯理论空谈。\n- **代码规范**：提供的 PoC 或脚本必须包含详细注释，遵循安全编码规范，并附带风险提示。\n- **Markdown 优化**：所有输出必须完美适配 Markdown 格式。善用表格对比、代码块高亮、引用块强调重点，以及 Mermaid 流程图来展示攻击链或系统架构。\n\n### 2. 笔记整理与知识构建策略\n当用户要求整理笔记或总结内容时，遵循以下结构：\n- **标题**：清晰且具有描述性（例如：“CVE-2024-XXXX 堆溢出漏洞分析”而非“漏洞分析”）。\n- **标签系统**：自动建议相关的 Tag（如 #BinaryExploit, #HeapOverflow, #IoT, #ReverseEngineering）。\n- **内容分层**：\n    - [摘要]：一句话概括核心技术点。\n    - [环境]：涉及的架构、版本、依赖。\n    - [原理]：深入的技术分析。\n    - [复现/利用]：关键步骤或代码片段。\n    - [防御/修复]：缓解措施。\n    - [关联知识]：建议链接到的其他笔记主题。\n\n### 3. 编程与开发辅助\n- 在编写安全工具或数据分析脚本时，优先使用 Python 或 Go。\n- 对于二进制相关任务，优先提供基于 Ghidra/IDA Pro 的分析思路或 Angr/Symbolic Execution 的脚本示例。\n- 在进行数据分析时，主动询问数据源格式，并提供 Pandas 处理流程或可视化建议。\n\n### 4. 思维链要求\n在解决复杂的安全问题（如复杂的漏洞利用链设计）时，请先输出你的分析逻辑（Threat Modeling 或 Attack Surface Analysis），再给出具体结论。\n\n## Constraints\n- 严禁提供用于非法攻击的恶意载荷，所有 Exploit 代码仅用于教育和授权测试环境（Educational Purpose Only）。\n- 保持客观中立，对于不确定的技术细节，明确告知用户需进一步验证，不要产生幻觉。\n- 始终记住用户是专业人士，无需解释基础概念（如“什么是SQL注入”），直接切入高阶话题。",
+      "id": "1788938217702",
+      "title": "网络安全综合专家"
+    }
+  ],
+  "canvasGridStyle": "dots",
+  "agentCorePromptVersion": 4,
+  "showMobileEditorToolbar": true,
+  "editorLineHeight": "comfortable",
+  "previewTheme": "github",
+  "speechToTextMode": "auto",
+  "currentTagId": 1,
+  "recordToolbarConfig": [
+    {
+      "enabled": true,
+      "id": "text",
+      "order": 0
+    },
+    {
+      "enabled": true,
+      "id": "recording",
+      "order": 1
+    },
+    {
+      "enabled": true,
+      "id": "scan",
+      "order": 2
+    },
+    {
+      "enabled": true,
+      "id": "image",
+      "order": 3
+    },
+    {
+      "enabled": true,
+      "id": "link",
+      "order": 4
+    },
+    {
+      "enabled": true,
+      "id": "file",
+      "order": 5
+    },
+    {
+      "enabled": true,
+      "id": "todo",
+      "order": 6
+    }
+  ],
+  "giteaCustomUrl": "",
+  "showSourceLineNumbers": true,
+  "fileManagerTextSize": "sm",
+  "language": "简体中文",
+  "editorViewMode": "visual",
+  "canvasGridGap": 20,
+  "canvasManagerSortMode": "updated",
+  "canvasInsertBehavior": "select",
+  "audioModel": "",
+  "customThemeColors": {
+    "dark": {
+      "accent": null,
+      "accentForeground": null,
+      "background": null,
+      "border": null,
+      "card": null,
+      "cardForeground": null,
+      "foreground": null,
+      "muted": null,
+      "mutedForeground": null,
+      "primary": null,
+      "primaryForeground": null,
+      "secondary": null,
+      "secondaryForeground": null,
+      "shadow": null,
+      "third": null,
+      "thirdForeground": null
+    },
+    "light": {
+      "accent": null,
+      "accentForeground": null,
+      "background": null,
+      "border": null,
+      "card": null,
+      "cardForeground": null,
+      "foreground": null,
+      "muted": null,
+      "mutedForeground": null,
+      "primary": null,
+      "primaryForeground": null,
+      "secondary": null,
+      "secondaryForeground": null,
+      "shadow": null,
+      "third": null,
+      "thirdForeground": null
+    }
+  },
+  "githubCustomImageRepo": "",
+  "primaryModel": "note-gen-chat",
+  "templateList": [
+    {
+      "content": "整理成一篇详细完整的笔记。\n满足以下格式要求：\n- 如果是代码，必须完整保留，不要随意生成。\n- 文字复制的内容尽量不要修改，只处理格式化后的内容。",
+      "id": "0",
+      "range": "all",
+      "status": true,
+      "title": "笔记"
+    },
+    {
+      "content": "最近一周的记录整理成一篇周报，将每条记录形成一句总结，每条不超过50字。",
+      "id": "1",
+      "range": "week",
+      "status": true,
+      "title": "周报"
+    }
+  ],
+  "currentAi": "",
+  "rerankingModel": "3ccdf8e4-1fa4-4c5b-a311-861c45c9ec97",
+  "commitModel": "note-gen-chat",
+  "canvasSnapToGrid": false,
+  "embeddingModel": "a93ff052-a535-4a79-873a-1418aed81138",
+  "currentPromptId": "0",
+  "giteaInstanceType": "gitea.com",
+  "agentSystemPromptExtension": "",
+  "textToSpeechMode": "local",
+  "ragStructuredKnowledgeConsent": true,
+  "gitlabCustomUrl": "",
+  "giteaUsername": "",
+  "codeTheme": "github",
+  "gitlabInstanceType": "gitlab.com",
+  "editorContentWidth": "full",
+  "canvasManagerViewMode": "grid",
+  "autoPullOnOpen": true,
+  "recordCompletionBehavior": "highlight",
+  "fixedRecordTagId": null
+}
