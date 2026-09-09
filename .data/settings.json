@@ -55,7 +55,7 @@
   ],
   "canvasGridGap": 20,
   "enableImageRecognition": true,
-  "embeddingModel": "a93ff052-a535-4a79-873a-1418aed81138",
+  "embeddingModel": "note-gen-embedding",
   "canvasMinimapVisible": true,
   "recordCompletionBehavior": "highlight",
   "ragStructuredKnowledgeConsent": true,
