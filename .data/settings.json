@@ -161,7 +161,7 @@
   "outlinePosition": "right",
   "canvasManagerViewMode": "grid",
   "completionModel": "note-gen-chat",
-  "agentPermissionMode": "ask",
+  "agentPermissionMode": "auto-edit",
   "enableOutline": true,
   "placeholderModel": "",
   "showSourceLineNumbers": true,
